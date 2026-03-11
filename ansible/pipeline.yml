@@ -2,59 +2,75 @@
 - name: Setup Core System Dependencies
   hosts: localhost
   become: true
+  vars:
+    keyrings_path: "/usr/share/keyrings"
+
   tasks:
-    - name: Remove problematic Snap versions
+    - name: 0.1 Pre-flight - Force clear APT locks
+      shell: |
+        rm -f /var/lib/dpkg/lock-frontend
+        rm -f /var/lib/apt/lists/lock
+        dpkg --configure -a
+      changed_when: false
+
+    - name: 0.2 Remove restricted Snap versions
       community.general.snap:
         name: [k6, docker]
         state: absent
 
-    - name: Install prerequisite packages
+    - name: 0.3 Install system prerequisites
       apt:
-        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release, python3-pip, python3-venv]
+        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release, python3-pip]
         state: present
         update_cache: yes
 
-    - name: Add GPG keys for Docker and k6
-      apt_key:
-        url: "{{ item.url }}"
-        id: "{{ item.id | default(omit) }}"
-        state: present
+    - name: 0.4 Add GPG keys (Docker, k6, Trivy)
+      shell: |
+        curl -fsSL {{ item.url }} | gpg --dearmor --yes -o {{ keyrings_path }}/{{ item.name }}.gpg
       loop:
-        - { url: 'https://download.docker.com/linux/ubuntu/gpg' }
-        - { url: 'https://dl.k6.io/key.gpg' }
+        - { url: "https://download.docker.com/linux/ubuntu/gpg", name: "docker-archive-keyring" }
+        - { url: "https://dl.k6.io/key.gpg", name: "k6-archive-keyring" }
+        - { url: "https://aquasecurity.github.io/trivy-repo/deb/public.key", name: "trivy-archive-keyring" }
+      args:
+        creates: "{{ keyrings_path }}/{{ item.name }}.gpg"
 
-    - name: Add Repositories
+    - name: 0.5 Add Repositories
       apt_repository:
         repo: "{{ item }}"
         state: present
       loop:
-        - "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-        - "deb https://dl.k6.io/deb stable main"
+        - "deb [arch=amd64 signed-by={{ keyrings_path }}/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        - "deb [signed-by={{ keyrings_path }}/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main"
+        - "deb [signed-by={{ keyrings_path }}/trivy-archive-keyring.gpg] https://aquasecurity.github.io/trivy-repo/deb {{ ansible_distribution_release }} main"
 
-    - name: Install Native Binaries
+    - name: 0.6 Install All Native Binaries
       apt:
-        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin, k6]
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin, k6, trivy]
         state: present
         update_cache: yes
 
-    - name: Ensure Docker service is running
-      service:
-        name: docker
-        state: started
-        enabled: yes
+    - name: 0.7 Configure Docker Service and Permissions
+      block:
+        - name: Ensure Docker is started
+          service:
+            name: docker
+            state: started
+            enabled: yes
+        - name: Add Jenkins to docker group
+          user:
+            name: "jenkins"
+            groups: docker
+            append: yes
+        - name: Fix Docker socket permissions for current session
+          file:
+            path: /var/run/docker.sock
+            mode: '0666'
 
-    - name: Add current user to docker group
-      user:
-        name: "{{ ansible_user_id }}"
-        groups: docker
-        append: yes
-      
 - name: SPE Research Automated Benchmark Pipeline
   hosts: localhost
   tasks:
-    - name: 1. Build and Start All Lanes (Python, Rust, WASM + Monitoring)
-      # This uses your docker-compose.yml to build all 3 lanes at once
-      shell: "docker-compose up --build -d"
+    - name: 1. Build and Start All Lanes
+      shell: "docker compose up --build -d"
 
     - name: 2. Wait for Services to Warm Up
       pause:
@@ -66,7 +82,6 @@
       ignore_errors: yes
 
     - name: 4. Performance Stress Test - k6 Loops
-      # Running your exact command format for each port
       shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
       loop:
         - { name: 'python', port: 8500 }
@@ -74,5 +89,4 @@
         - { name: 'wasm',   port: 8502 }
 
     - name: 5. Shutdown Environment
-      # Keeps your peters-pavilion machine clean after the tests
-      shell: "docker-compose down"
+      shell: "docker compose down"
