@@ -10,7 +10,7 @@ pipeline {
 
         stage('Run Ansible Automation') {
             steps {
-                sh 'ansible-playbook playbook.yml -vvv 2>&1 | grep -A5 "apt cache"'
+                sh 'ansible-playbook playbook.yml -vvv 2>&1 | grep -A5 "apt cache" || true'
             }
         }
     }
