@@ -2,29 +2,39 @@
 - name: SPE Research Infrastructure & Benchmark Pipeline
   hosts: localhost
   connection: local
-  become: yes  # Required to install packages
-  
+  become: yes
   vars:
-    # Tool versions for consistency in your paper
     k6_version: "0.49.0"
     trivy_version: "0.49.1"
 
   tasks:
     - name: 1. Ensure Prerequisites (Docker & Dependencies)
       apt:
-        name: 
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
           - docker.io
           - docker-compose
           - curl
           - git
+          - wget
         state: present
         update_cache: yes
+      register: apt_result
+      retries: 3
+      delay: 5
+      until: apt_result is succeeded
 
     - name: 2. Install k6 (Performance Testing)
       shell: |
-        gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/bin/deb stable main" | tee /etc/apt/sources.list.d/k6.list
-        apt-get update && apt-get install k6 -y
+        gpg --no-default-keyring \
+          --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+          --keyserver hkp://keyserver.ubuntu.com:80 \
+          --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/bin/deb stable main" \
+          | tee /etc/apt/sources.list.d/k6.list
+        apt-get update && apt-get install -y k6
       args:
         creates: /usr/bin/k6
 
@@ -35,21 +45,20 @@
 
     - name: 4. Install Trivy (Vulnerability Scanning)
       shell: |
-        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | tee /usr/share/keyrings/trivy.gpg > /dev/null
-        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | tee -a /etc/apt/sources.list.d/trivy.list
-        apt-get update && apt-get install trivy -y
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+          | gpg --dearmor \
+          | tee /usr/share/keyrings/trivy.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+          | tee /etc/apt/sources.list.d/trivy.list
+        apt-get update && apt-get install -y trivy
       args:
         creates: /usr/bin/trivy
-
-    # --- Start of your actual Benchmark Logic ---
 
     - name: 5. Build and Start All Lanes
       shell: "docker-compose up --build -d"
       become: no
 
     - name: 6. Compliance Audit - Generate SBOMs (Syft)
-      # This command scans the images created by your docker-compose
-      # and outputs the "ingredients list" of the containers
       shell: "syft secure-{{ item }}:latest -o json > sbom-{{ item }}.json"
       loop: ['python', 'rust', 'wasm']
       become: no
