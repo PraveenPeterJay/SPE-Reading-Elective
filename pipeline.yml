@@ -1,0 +1,28 @@
+---
+- name: SPE Research Automated Benchmark Pipeline
+  hosts: localhost
+  tasks:
+    - name: 1. Build and Start All Lanes (Python, Rust, WASM + Monitoring)
+      # This uses your docker-compose.yml to build all 3 lanes at once
+      shell: "docker-compose up --build -d"
+
+    - name: 2. Wait for Services to Warm Up
+      pause:
+        seconds: 10
+
+    - name: 3. Security Audit - Trivy Image Scans
+      shell: "trivy image --severity HIGH,CRITICAL --format json -o trivy-{{ item }}.json secure-{{ item }}:latest"
+      loop: ['python', 'rust', 'wasm']
+      ignore_errors: yes
+
+    - name: 4. Performance Stress Test - k6 Loops
+      # Running your exact command format for each port
+      shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
+      loop:
+        - { name: 'python', port: 8500 }
+        - { name: 'rust',   port: 8501 }
+        - { name: 'wasm',   port: 8502 }
+
+    - name: 5. Shutdown Environment
+      # Keeps your peters-pavilion machine clean after the tests
+      shell: "docker-compose down"
