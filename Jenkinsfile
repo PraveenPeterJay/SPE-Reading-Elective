@@ -4,22 +4,24 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                git branch: 'main', url: 'https://github.com/PraveenPeterJay/SPE-Reading-Elective.git'
+                checkout scm
             }
         }
 
         stage('Run Ansible Automation') {
             steps {
-                // This calls the playbook we wrote above
-                ansiblePlaybook playbook: 'pipeline.yml'
+                // Using the direct shell command ensures we bypass plugin DSL issues
+                // -i points to your inventory, then the playbook path
+                sh "/usr/bin/ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml"
             }
         }
+    }
 
-        stage('Archive Artifacts') {
-            steps {
-                // This saves your test results in Jenkins so you can download them
-                archiveArtifacts artifacts: '*.json, *.txt', allowEmptyArchive: true
-            }
+    post {
+        always {
+            // This ensures results are saved even if a test or build fails
+            echo "Archiving research data..."
+            archiveArtifacts artifacts: '*.json, *.txt', allowEmptyArchive: true
         }
     }
 }
