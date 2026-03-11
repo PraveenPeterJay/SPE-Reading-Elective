@@ -1,4 +1,54 @@
 ---
+- name: Setup Core System Dependencies
+  hosts: localhost
+  become: true
+  tasks:
+    - name: Remove problematic Snap versions
+      community.general.snap:
+        name: [k6, docker]
+        state: absent
+
+    - name: Install prerequisite packages
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release, python3-pip, python3-venv]
+        state: present
+        update_cache: yes
+
+    - name: Add GPG keys for Docker and k6
+      apt_key:
+        url: "{{ item.url }}"
+        id: "{{ item.id | default(omit) }}"
+        state: present
+      loop:
+        - { url: 'https://download.docker.com/linux/ubuntu/gpg' }
+        - { url: 'https://dl.k6.io/key.gpg' }
+
+    - name: Add Repositories
+      apt_repository:
+        repo: "{{ item }}"
+        state: present
+      loop:
+        - "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        - "deb https://dl.k6.io/deb stable main"
+
+    - name: Install Native Binaries
+      apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin, k6]
+        state: present
+        update_cache: yes
+
+    - name: Ensure Docker service is running
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add current user to docker group
+      user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: yes
+      
 - name: SPE Research Automated Benchmark Pipeline
   hosts: localhost
   tasks:
