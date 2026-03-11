@@ -9,12 +9,14 @@ pipeline {
         }
 
         stage('Jenkins sudo test') {
-            sh '''
-                sudo apt-get update 2>&1 || true
-                sudo -l -U jenkins  # Check what jenkins can sudo
-                cat /etc/apt/sources.list
-                ls /etc/apt/sources.list.d/
-            '''
+            steps {
+                sh '''
+                    sudo apt-get update 2>&1 || true
+                    sudo -l -U jenkins  # Check what jenkins can sudo
+                    cat /etc/apt/sources.list
+                    ls /etc/apt/sources.list.d/
+                '''
+            }
         }
 
         stage('Run Ansible Pipeline') {
