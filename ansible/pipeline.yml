@@ -28,6 +28,16 @@
         fi
       become: yes
 
+    - name: 0d. Fix Jenkins repo GPG key
+      shell: |
+        wget -O /usr/share/keyrings/jenkins-keyring.asc \
+          https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable|' \
+          /etc/apt/sources.list.d/jenkins.list
+      args:
+        creates: /usr/share/keyrings/jenkins-keyring.asc
+      become: yes
+
     - name: 1. Ensure Prerequisites (Docker & Dependencies)
       apt:
         name:
