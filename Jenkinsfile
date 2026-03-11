@@ -10,7 +10,7 @@ pipeline {
 
         stage('Run Ansible Automation') {
             steps {
-                sh "ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml"
+                sh 'ansible-playbook playbook.yml -vvv 2>&1 | grep -A5 "apt cache"'
             }
         }
     }
