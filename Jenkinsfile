@@ -8,9 +8,22 @@ pipeline {
             }
         }
 
-        stage('Run Ansible Automation') {
+        stage('Jenkins sudo test') {
+            sh '''
+                sudo apt-get update 2>&1 || true
+                sudo -l -U jenkins  # Check what jenkins can sudo
+                cat /etc/apt/sources.list
+                ls /etc/apt/sources.list.d/
+            '''
+        }
+
+        stage('Run Ansible Pipeline') {
             steps {
-                sh 'ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml -vvv 2>&1 | grep -A5 "apt cache" || true'
+                sh '''
+                    # Verify sudo works before ansible runs
+                    sudo apt-get update -qq
+                    ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml -vvv
+                '''
             }
         }
     }

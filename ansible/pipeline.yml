@@ -8,6 +8,26 @@
     trivy_version: "0.49.1"
 
   tasks:
+    - name: 0. Debug - Check sudo and apt
+      shell: |
+        whoami
+        apt-get update 2>&1 || echo "APT FAILED: $?"
+        cat /etc/apt/sources.list | head -5
+      register: debug_out
+      ignore_errors: yes
+
+    - name: 0b. Show debug output
+      debug:
+        var: debug_out.stdout_lines
+
+    - name: 0c. Fix apt sources if empty
+      shell: |
+        if [ ! -s /etc/apt/sources.list ]; then
+          echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list
+        fi
+      become: yes
+
     - name: 1. Ensure Prerequisites (Docker & Dependencies)
       apt:
         name:
