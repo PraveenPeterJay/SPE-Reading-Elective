@@ -101,6 +101,8 @@
 
     - name: 8. Performance Stress Test - k6
       shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
+      args:
+        chdir: /var/lib/jenkins/workspace/SPE-RE
       loop:
         - { name: 'python', port: 8500 }
         - { name: 'rust',   port: 8501 }
