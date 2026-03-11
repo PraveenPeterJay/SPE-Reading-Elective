@@ -10,9 +10,7 @@ pipeline {
 
         stage('Run Ansible Automation') {
             steps {
-                // Using the direct shell command ensures we bypass plugin DSL issues
-                // -i points to your inventory, then the playbook path
-                sh "/usr/bin/ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml"
+                sh "ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml"
             }
         }
     }
