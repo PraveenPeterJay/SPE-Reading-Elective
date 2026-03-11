@@ -1,92 +1,69 @@
 ---
-- name: Setup Core System Dependencies
+- name: SPE Research Infrastructure & Benchmark Pipeline
   hosts: localhost
-  become: true
+  connection: local
+  become: yes  # Required to install packages
+  
   vars:
-    keyrings_path: "/usr/share/keyrings"
+    # Tool versions for consistency in your paper
+    k6_version: "0.49.0"
+    trivy_version: "0.49.1"
 
   tasks:
-    - name: 0.1 Pre-flight - Force clear APT locks
-      shell: |
-        rm -f /var/lib/dpkg/lock-frontend
-        rm -f /var/lib/apt/lists/lock
-        dpkg --configure -a
-      changed_when: false
-
-    - name: 0.2 Remove restricted Snap versions
-      community.general.snap:
-        name: [k6, docker]
-        state: absent
-
-    - name: 0.3 Install system prerequisites
+    - name: 1. Ensure Prerequisites (Docker & Dependencies)
       apt:
-        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release, python3-pip]
+        name: 
+          - docker.io
+          - docker-compose
+          - curl
+          - git
         state: present
         update_cache: yes
 
-    - name: 0.4 Add GPG keys (Docker, k6, Trivy)
+    - name: 2. Install k6 (Performance Testing)
       shell: |
-        curl -fsSL {{ item.url }} | gpg --dearmor --yes -o {{ keyrings_path }}/{{ item.name }}.gpg
-      loop:
-        - { url: "https://download.docker.com/linux/ubuntu/gpg", name: "docker-archive-keyring" }
-        - { url: "https://dl.k6.io/key.gpg", name: "k6-archive-keyring" }
-        - { url: "https://aquasecurity.github.io/trivy-repo/deb/public.key", name: "trivy-archive-keyring" }
+        gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/bin/deb stable main" | tee /etc/apt/sources.list.d/k6.list
+        apt-get update && apt-get install k6 -y
       args:
-        creates: "{{ keyrings_path }}/{{ item.name }}.gpg"
+        creates: /usr/bin/k6
 
-    - name: 0.5 Add Repositories
-      apt_repository:
-        repo: "{{ item }}"
-        state: present
-      loop:
-        - "deb [arch=amd64 signed-by={{ keyrings_path }}/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-        - "deb [signed-by={{ keyrings_path }}/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main"
-        - "deb [signed-by={{ keyrings_path }}/trivy-archive-keyring.gpg] https://aquasecurity.github.io/trivy-repo/deb {{ ansible_distribution_release }} main"
+    - name: 3. Install Syft (SBOM Generation)
+      shell: "curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin"
+      args:
+        creates: /usr/local/bin/syft
 
-    - name: 0.6 Install All Native Binaries
-      apt:
-        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin, k6, trivy]
-        state: present
-        update_cache: yes
+    - name: 4. Install Trivy (Vulnerability Scanning)
+      shell: |
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | tee /usr/share/keyrings/trivy.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | tee -a /etc/apt/sources.list.d/trivy.list
+        apt-get update && apt-get install trivy -y
+      args:
+        creates: /usr/bin/trivy
 
-    - name: 0.7 Configure Docker Service and Permissions
-      block:
-        - name: Ensure Docker is started
-          service:
-            name: docker
-            state: started
-            enabled: yes
-        - name: Add Jenkins to docker group
-          user:
-            name: "jenkins"
-            groups: docker
-            append: yes
-        - name: Fix Docker socket permissions for current session
-          file:
-            path: /var/run/docker.sock
-            mode: '0666'
+    # --- Start of your actual Benchmark Logic ---
 
-- name: SPE Research Automated Benchmark Pipeline
-  hosts: localhost
-  tasks:
-    - name: 1. Build and Start All Lanes
-      shell: "docker compose up --build -d"
+    - name: 5. Build and Start All Lanes
+      shell: "docker-compose up --build -d"
+      become: no
 
-    - name: 2. Wait for Services to Warm Up
-      pause:
-        seconds: 10
+    - name: 6. Compliance Audit - Generate SBOMs (Syft)
+      # This command scans the images created by your docker-compose
+      # and outputs the "ingredients list" of the containers
+      shell: "syft secure-{{ item }}:latest -o json > sbom-{{ item }}.json"
+      loop: ['python', 'rust', 'wasm']
+      become: no
 
-    - name: 3. Security Audit - Trivy Image Scans
+    - name: 7. Security Audit - Trivy Image Scans
       shell: "trivy image --severity HIGH,CRITICAL --format json -o trivy-{{ item }}.json secure-{{ item }}:latest"
       loop: ['python', 'rust', 'wasm']
+      become: no
       ignore_errors: yes
 
-    - name: 4. Performance Stress Test - k6 Loops
+    - name: 8. Performance Stress Test - k6
       shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
       loop:
         - { name: 'python', port: 8500 }
         - { name: 'rust',   port: 8501 }
         - { name: 'wasm',   port: 8502 }
-
-    - name: 5. Shutdown Environment
-      shell: "docker compose down"
+      become: no
