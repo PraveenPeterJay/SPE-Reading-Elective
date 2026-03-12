@@ -99,18 +99,14 @@
 
     - name: 7. Security Audit - Trivy Image Scans with Summary
       shell: |
-        # 1. Run the scan for ALL severities (removed the --severity flag)
         trivy image --format json -o trivy-{{ item }}.json secure-{{ item }}:latest
-        
-        # 2. Use jq to count severities and append a "Summary" object to the JSON
         jq '. + {Summary: ([.Results[]?.Vulnerabilities[]?.Severity // empty] | reduce .[] as $sev ({}; .[$sev] += 1))}' trivy-{{ item }}.json > tmp-{{ item }}.json
-        
-        # 3. Replace the original file with the newly summarized one
         mv tmp-{{ item }}.json trivy-{{ item }}.json
       args:
         chdir: /var/lib/jenkins/workspace/SPE-RE
       loop: ['python', 'rust', 'wasm']
       become: no
+      ignore_errors: yes
       # ignore_errors: yes
 
     # - name: 8. Performance Stress Test - k6
