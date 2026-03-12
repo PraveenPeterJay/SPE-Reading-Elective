@@ -41,6 +41,7 @@
     - name: 1. Ensure Prerequisites (Docker & Dependencies)
       apt:
         name:
+          - jq
           - apt-transport-https
           - ca-certificates
           - gnupg
