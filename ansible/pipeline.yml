@@ -6,6 +6,7 @@
   vars:
     k6_version: "0.49.0"
     trivy_version: "0.49.1"
+    workspace: /var/lib/jenkins/workspace/SPE-RE
 
   tasks:
     - name: 0. Debug - Check sudo and apt
@@ -97,12 +98,12 @@
       shell: "trivy image --severity HIGH,CRITICAL --format json -o trivy-{{ item }}.json secure-{{ item }}:latest"
       loop: ['python', 'rust', 'wasm']
       become: no
-      ignore_errors: yes
+      # ignore_errors: yes
 
     - name: 8. Performance Stress Test - k6
       shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
-      args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
+      # args:
+      #   chdir: /var/lib/jenkins/workspace/SPE-RE
       loop:
         - { name: 'python', port: 8500 }
         - { name: 'rust',   port: 8501 }
