@@ -3,42 +3,40 @@
   hosts: localhost
   connection: local
   become: yes
+
   vars:
-    k6_version: "0.49.0"
-    trivy_version: "0.49.1"
+    workspace: /var/lib/jenkins/workspace/SPE-RE
+    lanes: [python, rust, wasm]
+    lane_ports:
+      python: 8500
+      rust:   8501
+      wasm:   8502
 
   tasks:
-    - name: 0. Debug - Check sudo and apt
-      shell: |
-        whoami
-        apt-get update 2>&1 || echo "APT FAILED: $?"
-        cat /etc/apt/sources.list | head -5
-      register: debug_out
-      ignore_errors: yes
 
-    - name: 0b. Show debug output
-      debug:
-        var: debug_out.stdout_lines
+    # ── 0. BOOTSTRAP ────────────────────────────────────────────────────────
 
-    - name: 0c. Fix apt sources if empty
+    - name: Ensure apt sources are present
       shell: |
         if [ ! -s /etc/apt/sources.list ]; then
-          echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list
-          echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" \
+            > /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" \
+            >> /etc/apt/sources.list
         fi
-      become: yes
 
-    - name: 0d. Fix Jenkins repo GPG key
+    - name: Fix Jenkins repo GPG key
       shell: |
         wget -O /usr/share/keyrings/jenkins-keyring.asc \
           https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
-        sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable|' \
-          /etc/apt/sources.list.d/jenkins.list
+        sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+          https://pkg.jenkins.io/debian-stable|' /etc/apt/sources.list.d/jenkins.list
       args:
         creates: /usr/share/keyrings/jenkins-keyring.asc
-      become: yes
 
-    - name: 1. Ensure Prerequisites (Docker & Dependencies)
+    # ── 1. SYSTEM DEPENDENCIES ──────────────────────────────────────────────
+
+    - name: Install system packages
       apt:
         name:
           - jq
@@ -52,76 +50,233 @@
           - wget
         state: present
         update_cache: yes
-      register: apt_result
       retries: 3
       delay: 5
-      until: apt_result is succeeded
+      until: result is succeeded
+      register: result
 
-    - name: 2. Install k6 (Performance Testing)
+    # ── 2. SECURITY & PERFORMANCE TOOLS ─────────────────────────────────────
+
+    - name: Install k6 (performance testing)
       shell: |
         gpg --no-default-keyring \
           --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
           --keyserver hkp://keyserver.ubuntu.com:80 \
           --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-          | tee /etc/apt/sources.list.d/k6.list
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+          https://dl.k6.io/deb stable main" | tee /etc/apt/sources.list.d/k6.list
         apt-get update && apt-get install -y k6
       args:
         creates: /usr/bin/k6
 
-    - name: 3. Install Syft (SBOM Generation)
-      shell: "curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin"
+    - name: Install Syft (SBOM generation)
+      shell: >
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh
+        | sh -s -- -b /usr/local/bin
       args:
         creates: /usr/local/bin/syft
 
-    - name: 4. Install Trivy (Vulnerability Scanning)
+    - name: Install Trivy (vulnerability scanning)
       shell: |
         wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-          | gpg --dearmor \
-          | tee /usr/share/keyrings/trivy.gpg > /dev/null
-        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+          | gpg --dearmor | tee /usr/share/keyrings/trivy.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] \
+          https://aquasecurity.github.io/trivy-repo/deb generic main" \
           | tee /etc/apt/sources.list.d/trivy.list
         apt-get update && apt-get install -y trivy
       args:
         creates: /usr/bin/trivy
 
-    - name: 5. Build and Start All Lanes
-      shell: "docker-compose up --build -d"
+    # ── 3. BUILD ─────────────────────────────────────────────────────────────
+
+    - name: Build and start all lanes
+      shell: docker-compose up --build -d
       args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
+        chdir: "{{ workspace }}"
       become: no
 
-    - name: 6. Compliance Audit - Generate SBOMs (Syft)
-      shell: "syft secure-{{ item }}:latest -o json > sbom-{{ item }}.json"
-      args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
-      loop: ['python', 'rust', 'wasm']
+    - name: Wait for all lanes to be ready
+      uri:
+        url: "http://localhost:{{ lane_ports[item] }}/health"
+        status_code: 200
+      loop: "{{ lanes }}"
+      retries: 10
+      delay: 3
+      register: health_check
+      until: health_check is succeeded
       become: no
 
-    - name: 7. Security Audit - Trivy Image Scans with Summary
+    # ── 4. COMPLIANCE & SECURITY AUDIT ──────────────────────────────────────
+
+    - name: Generate SBOMs (Syft / CycloneDX)
+      shell: >
+        syft secure-{{ item }}:latest -o cyclonedx-json
+        > {{ workspace }}/sbom-{{ item }}.json
+      loop: "{{ lanes }}"
+      become: no
+
+    - name: Collect image size metrics
+      shell: >
+        docker image inspect secure-{{ item }}:latest
+        --format '{"image":"secure-{{ item }}","size_bytes":{{"{{"}}".Size{{"}}"}}}'
+        > {{ workspace }}/image-size-{{ item }}.json
+      loop: "{{ lanes }}"
+      become: no
+
+    - name: Trivy vulnerability scan (JSON + severity summary)
       shell: |
-        trivy image --format json -o trivy-{{ item }}.json secure-{{ item }}:latest
-        jq '. + {Summary: ([.Results[]?.Vulnerabilities[]?.Severity // empty] | reduce .[] as $sev ({}; .[$sev] += 1))}' trivy-{{ item }}.json > tmp-{{ item }}.json
-        mv tmp-{{ item }}.json trivy-{{ item }}.json
-      args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
-      loop: ['python', 'rust', 'wasm']
-      become: no
+        trivy image --format json -o {{ workspace }}/trivy-{{ item }}.json \
+          secure-{{ item }}:latest
+        jq '. + {Summary: ([.Results[]?.Vulnerabilities[]?.Severity // empty]
+          | reduce .[] as $s ({}; .[$s] += 1))}' \
+          {{ workspace }}/trivy-{{ item }}.json > /tmp/trivy-{{ item }}.json
+        mv /tmp/trivy-{{ item }}.json {{ workspace }}/trivy-{{ item }}.json
+      loop: "{{ lanes }}"
       ignore_errors: yes
-      # ignore_errors: yes
+      become: no
 
-    # - name: 8. Performance Stress Test - k6
-    #   shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
-    #   args:
-    #     chdir: /var/lib/jenkins/workspace/SPE-RE
-    #   loop:
-    #     - { name: 'python', port: 8500 }
-    #     - { name: 'rust',   port: 8501 }
-    #     - { name: 'wasm',   port: 8502 }
-    #   become: no
+    # ── 5. PERFORMANCE BENCHMARKS ────────────────────────────────────────────
 
-    - name: 9. Stop and Clean Up All Lanes
-      shell: "docker-compose down"
+    - name: k6 stress test per lane
+      shell: >
+        k6 run
+        -e PORT={{ lane_ports[item] }}
+        --summary-export={{ workspace }}/perf-{{ item }}.json
+        {{ workspace }}/stress-test.js
+      loop: "{{ lanes }}"
+      become: no
+
+    - name: Collect cold-start latency
+      shell: |
+        docker-compose stop {{ item }}
+        START=$(date +%s%N)
+        docker-compose start {{ item }}
+        curl -s --retry 10 --retry-delay 1 \
+          http://localhost:{{ lane_ports[item] }}/health > /dev/null
+        END=$(date +%s%N)
+        echo "{\"lane\":\"{{ item }}\",\"cold_start_ms\":$(( (END - START) / 1000000 ))}" \
+          > {{ workspace }}/coldstart-{{ item }}.json
       args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
+        chdir: "{{ workspace }}"
+      loop: "{{ lanes }}"
+      become: no
+
+    # ── 6. UNIFIED SUMMARY ────────────────────────────────────────────────────
+    #
+    # Merges trivy, sbom component count, image size, perf, and cold-start
+    # for each lane into a single ranked comparison table.
+
+    - name: Generate unified benchmark summary
+      shell: |
+        python3 << 'EOF'
+        import json, glob, os
+
+        lanes   = ['python', 'rust', 'wasm']
+        ws      = "{{ workspace }}"
+        summary = {}
+
+        for lane in lanes:
+            entry = {"lane": lane}
+
+            # --- security: CVE counts per severity ---
+            tv = f"{ws}/trivy-{lane}.json"
+            if os.path.exists(tv):
+                with open(tv) as f:
+                    t = json.load(f)
+                entry["cve_summary"] = t.get("Summary", {})
+                entry["cve_total"]   = sum(entry["cve_summary"].values())
+
+            # --- compliance: SBOM component count ---
+            sb = f"{ws}/sbom-{lane}.json"
+            if os.path.exists(sb):
+                with open(sb) as f:
+                    s = json.load(f)
+                entry["sbom_components"] = len(s.get("components", []))
+
+            # --- image size ---
+            im = f"{ws}/image-size-{lane}.json"
+            if os.path.exists(im):
+                with open(im) as f:
+                    entry["image_size_mb"] = round(
+                        json.load(f).get("size_bytes", 0) / 1e6, 1)
+
+            # --- performance (k6 summary) ---
+            pf = f"{ws}/perf-{lane}.json"
+            if os.path.exists(pf):
+                with open(pf) as f:
+                    p = json.load(f)
+                metrics = p.get("metrics", {})
+                entry["p95_latency_ms"] = round(
+                    metrics.get("http_req_duration", {})
+                           .get("values", {})
+                           .get("p(95)", 0), 2)
+                entry["rps"] = round(
+                    metrics.get("http_reqs", {})
+                           .get("values", {})
+                           .get("rate", 0), 2)
+
+            # --- cold-start ---
+            cs = f"{ws}/coldstart-{lane}.json"
+            if os.path.exists(cs):
+                with open(cs) as f:
+                    entry["cold_start_ms"] = json.load(f).get("cold_start_ms")
+
+            summary[lane] = entry
+
+        # --- rank each lane by composite score (lower CVEs + size + latency = better) ---
+        def score(e):
+            return (
+                e.get("cve_total", 999) * 10 +
+                e.get("image_size_mb", 999) * 0.1 +
+                e.get("p95_latency_ms", 9999) * 0.01 +
+                e.get("cold_start_ms", 9999) * 0.001
+            )
+
+        ranked = sorted(summary.values(), key=score)
+        for i, r in enumerate(ranked):
+            r["rank"] = i + 1
+
+        output = {
+            "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "winner": ranked[0]["lane"],
+            "lanes": ranked
+        }
+
+        out_path = f"{ws}/benchmark-summary.json"
+        with open(out_path, "w") as f:
+            json.dump(output, f, indent=2)
+
+        # Human-readable table to stdout (captured by Ansible)
+        print(f"\n{'='*60}")
+        print(f"  SPE BENCHMARK SUMMARY")
+        print(f"{'='*60}")
+        fmt = "{:<8}  {:>5}  {:>8}  {:>10}  {:>8}  {:>10}"
+        print(fmt.format("Lane","Rank","CVEs","Size(MB)","p95(ms)","ColdStart"))
+        print("-"*60)
+        for r in ranked:
+            print(fmt.format(
+                r["lane"], r["rank"],
+                r.get("cve_total","N/A"),
+                r.get("image_size_mb","N/A"),
+                r.get("p95_latency_ms","N/A"),
+                r.get("cold_start_ms","N/A")
+            ))
+        print(f"\n  WINNER: {ranked[0]['lane'].upper()}  (lowest composite risk score)")
+        print(f"{'='*60}\n")
+        EOF
+      args:
+        chdir: "{{ workspace }}"
+      become: no
+      register: summary_output
+
+    - name: Print benchmark summary
+      debug:
+        msg: "{{ summary_output.stdout_lines }}"
+
+    # ── 7. TEARDOWN ───────────────────────────────────────────────────────────
+
+    - name: Stop and remove all lane containers
+      shell: docker-compose down
+      args:
+        chdir: "{{ workspace }}"
       become: no
