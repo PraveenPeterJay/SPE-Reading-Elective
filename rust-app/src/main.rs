@@ -15,8 +15,7 @@ struct AppState {
     session: Mutex<Session>,
     scaler_mean:  Vec<f32>,
     scaler_scale: Vec<f32>,
-    input_shape: Vec<usize>, // Dynamically stored
-    input_name: String,      // Dynamically stored
+    n_features:   usize,
 }
 
 // ─────────────────────────────────────────────
@@ -44,7 +43,6 @@ struct PredictResponse {
     confidence:  f64,
     latency_ms:  f64,
     runtime:     String,
-    features_processed: usize,
 }
 
 #[derive(Serialize)]
@@ -61,45 +59,48 @@ struct BatchResponse {
     n_samples:       usize,
     accuracy:        Option<f64>,
     mean_latency_ms: f64,
+    p99_latency_ms:  f64,
+    std_latency_ms:  f64,
     runtime:         String,
 }
 
 // ─────────────────────────────────────────────
-// 3. Pre-processing (Generic Shape)
+// 3. Pre-processing (Generic Dimension)
 // ─────────────────────────────────────────────
-fn preprocess(features: &[f32], mean: &[f32], scale: &[f32], expected: usize)
+fn preprocess(features: &[f32], mean: &[f32], scale: &[f32])
     -> Result<Array2<f32>, String>
 {
+    let expected = mean.len();
     if features.len() != expected {
-        return Err(format!("Model expects {} features, got {}", expected, features.len()));
+        return Err(format!("Dimension mismatch: expected {} features, got {}", expected, features.len()));
     }
+    
     let scaled: Vec<f32> = features.iter().enumerate()
         .map(|(i, &v)| (v - mean[i]) / scale[i])
         .collect();
-    
+
     Array2::from_shape_vec((1, expected), scaled)
         .map_err(|e| e.to_string())
 }
 
 // ─────────────────────────────────────────────
-// 4. Run Generic Inference
+// 4. Core Inference
 // ─────────────────────────────────────────────
 fn infer(
-    state:    &AppState,
+    session:  &mut Session,
     features: &[f32],
+    mean:     &[f32],
+    scale:    &[f32],
 ) -> Result<(i64, f64, f64), String> {
-    let mut session = state.session.lock().unwrap();
-    let expected_count = state.scaler_mean.len();
-    
-    let arr = preprocess(features, &state.scaler_mean, &state.scaler_scale, expected_count)?;
-    
-    let t0 = Instant::now();
+    let n_features = mean.len();
+    let arr = preprocess(features, mean, scale)?;
+    let shape = [1usize, n_features];
 
-    // Use dynamic shape from state
-    let tensor = Tensor::from_array((state.input_shape.clone(), arr.into_raw_vec()))
+    let t0 = Instant::now();
+    let tensor = Tensor::from_array((shape, arr.into_raw_vec()))
         .map_err(|e| e.to_string())?;
 
-    let outputs = session.run(ort::inputs![&state.input_name => tensor])
+    let outputs = session.run(ort::inputs![tensor])
         .map_err(|e| e.to_string())?;
 
     let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -110,12 +111,15 @@ fn infer(
         .map_err(|e| e.to_string())?;
     let predicted = labels[0];
 
-    // Generic Confidence Extraction
+    // Extract Confidence (safely mapping to the predicted index)
     let confidence = if outputs.len() > 1 {
         match outputs[1].try_extract_tensor::<f32>() {
             Ok((_, probs)) => {
-                let p = probs.as_slice().unwrap();
-                if p.len() > predicted as usize { p[predicted as usize] as f64 } else { 1.0 }
+                if (predicted as usize) < probs.len() {
+                    probs[predicted as usize] as f64
+                } else {
+                    1.0 // Fallback if probability array shape is unexpected
+                }
             }
             Err(_) => 1.0,
         }
@@ -127,71 +131,95 @@ fn infer(
 }
 
 // ─────────────────────────────────────────────
-// 5. Handlers
+// 5. POST /predict
 // ─────────────────────────────────────────────
 #[post("/predict")]
 async fn predict(
     body: web::Json<PredictRequest>,
     data: web::Data<AppState>,
 ) -> impl Responder {
-    match infer(&data, &body.features) {
+    let mut session = data.session.lock().unwrap();
+    match infer(&mut session, &body.features, &data.scaler_mean, &data.scaler_scale) {
         Ok((label, conf, lat)) => HttpResponse::Ok().json(PredictResponse {
             prediction: label,
             confidence: (conf * 1e6).round() / 1e6,
             latency_ms: (lat  * 1e4).round() / 1e4,
-            runtime:    "rust-onnx".into(),
-            features_processed: data.scaler_mean.len(),
+            runtime:    "rust-ort-generic".into(),
         }),
         Err(e) => HttpResponse::UnprocessableEntity().json(serde_json::json!({ "error": e })),
     }
 }
 
+// ─────────────────────────────────────────────
+// 6. POST /batch
+// ─────────────────────────────────────────────
 #[post("/batch")]
 async fn batch(
     body: web::Json<BatchRequest>,
     data: web::Data<AppState>,
 ) -> impl Responder {
-    let mut results = Vec::new();
+    if body.samples.is_empty() {
+        return HttpResponse::UnprocessableEntity().json(serde_json::json!({ "error": "Empty samples list" }));
+    }
+
+    let mut session  = data.session.lock().unwrap();
+    let mut results  = Vec::new();
     let mut latencies = Vec::new();
-    let mut correct = 0usize;
+    let mut correct  = 0usize;
 
     for s in &body.samples {
-        if let Ok((pred, conf, lat)) = infer(&data, &s.features) {
-            latencies.push(lat);
-            if let Some(lbl) = s.label { if pred == lbl { correct += 1; } }
-            results.push(SampleResult {
-                prediction: pred,
-                confidence: (conf * 1e6).round() / 1e6,
-                latency_ms: (lat  * 1e4).round() / 1e4,
-                true_label: s.label,
-            });
+        match infer(&mut session, &s.features, &data.scaler_mean, &data.scaler_scale) {
+            Ok((pred, conf, lat)) => {
+                latencies.push(lat);
+                if let Some(lbl) = s.label { if pred == lbl { correct += 1; } }
+                results.push(SampleResult {
+                    prediction: pred,
+                    confidence: (conf * 1e6).round() / 1e6,
+                    latency_ms: (lat  * 1e4).round() / 1e4,
+                    true_label: s.label,
+                });
+            }
+            Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": e })),
         }
     }
 
     let n = latencies.len() as f64;
-    let mean_lat = if n > 0.0 { latencies.iter().sum::<f64>() / n } else { 0.0 };
+    let mean_lat = latencies.iter().sum::<f64>() / n;
+    let std_lat  = (latencies.iter().map(|&x| (x - mean_lat).powi(2)).sum::<f64>() / n).sqrt();
+    let mut sorted = latencies.clone(); sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p99_idx  = ((n * 0.99) as usize).min(sorted.len() - 1);
+    let accuracy = if body.samples.iter().any(|s| s.label.is_some()) {
+        Some((correct as f64 / n * 1e4).round() / 1e4)
+    } else { None };
 
     HttpResponse::Ok().json(BatchResponse {
         results,
-        n_samples: body.samples.len(),
-        accuracy: if n > 0.0 { Some(correct as f64 / n) } else { None },
+        n_samples:       body.samples.len(),
+        accuracy,
         mean_latency_ms: (mean_lat * 1e4).round() / 1e4,
-        runtime: "rust-onnx".into(),
+        p99_latency_ms:  (sorted[p99_idx] * 1e4).round() / 1e4,
+        std_latency_ms:  (std_lat  * 1e4).round() / 1e4,
+        runtime:         "rust-ort-generic".into(),
     })
 }
 
+// ─────────────────────────────────────────────
+// 7. GET /health
+// ─────────────────────────────────────────────
 #[get("/health")]
 async fn health(data: web::Data<AppState>) -> impl Responder {
     let rss_kb: u64 = fs::read_to_string("/proc/self/status")
-        .unwrap_or_default().lines()
-        .find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok()).unwrap_or(0);
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "runtime": "rust-onnx",
-        "rss_mb": (rss_kb as f64 / 1024.0),
-        "expected_features": data.scaler_mean.len()
+        "status":     "ok",
+        "n_features": data.n_features,
+        "rss_mb":     (rss_kb as f64 / 1024.0 * 100.0).round() / 100.0,
     }))
 }
 
@@ -200,43 +228,44 @@ async fn health(data: web::Data<AppState>) -> impl Responder {
 // ─────────────────────────────────────────────
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| "/app/model_artifacts/model.onnx".into());
+    let model_path  = std::env::var("MODEL_PATH").unwrap_or_else(|_| "/app/model_artifacts/model.onnx".into());
     let scaler_path = std::env::var("SCALER_PATH").unwrap_or_else(|_| "/app/model_artifacts/scaler.json".into());
 
-    // 1. Robust Scaler Loading
-    let scaler_raw: Value = serde_json::from_str(&fs::read_to_string(&scaler_path).expect("Read error"))
-        .expect("JSON error");
+    let scaler_raw: Value = serde_json::from_str(
+        &fs::read_to_string(&scaler_path).expect("Cannot read scaler.json")
+    ).expect("Invalid scaler JSON");
+
+    let scaler_mean: Vec<f32> = scaler_raw["mean"].as_array().unwrap()
+        .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    let scaler_scale: Vec<f32> = scaler_raw["scale"].as_array().unwrap()
+        .iter().map(|v| v.as_f64().unwrap() as f32).collect();
     
-    // Check for 'mean' OR 'mean_'
-    let mean_val = scaler_raw.get("mean").or(scaler_raw.get("mean_")).expect("No mean key");
-    let scale_val = scaler_raw.get("scale").or(scaler_raw.get("std")).expect("No scale key");
+    let n_features = scaler_mean.len();
+    println!("Scaler loaded ({} features).", n_features);
 
-    let scaler_mean: Vec<f32> = mean_val.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
-    let scaler_scale: Vec<f32> = scale_val.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
-
-    // 2. Load Session and Extract Metadata
-    let session = Session::builder().unwrap()
-        .with_optimization_level(GraphOptimizationLevel::Level3).unwrap()
-        .commit_from_file(&model_path).unwrap();
-
-    let input = &session.inputs[0];
-    let input_name = input.name.clone();
-    // Extract dynamic shape [Batch, Features]
-    let input_shape: Vec<usize> = input.input_type.tensor_type().unwrap().1
-        .iter().map(|&d| if d == -1 { 1 } else { d as usize }).collect();
-
-    println!("Generic Rust Lane: Model expects {} features.", scaler_mean.len());
+    let session = Session::builder()
+        .unwrap()
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .unwrap()
+        .commit_from_file(&model_path)
+        .unwrap();
 
     let state = web::Data::new(AppState {
-        session: Mutex::new(session),
+        session:      Mutex::new(session),
         scaler_mean,
         scaler_scale,
-        input_shape,
-        input_name,
+        n_features,
     });
 
+    println!("Starting server on 0.0.0.0:8000");
     HttpServer::new(move || {
-        App::new().app_data(state.clone()).service(predict).service(batch).service(health)
+        App::new()
+            .app_data(state.clone())
+            .service(predict)
+            .service(batch)
+            .service(health)
     })
-    .bind(("0.0.0.0", 8000))?.run().await
+    .bind(("0.0.0.0", 8000))?
+    .run()
+    .await
 }

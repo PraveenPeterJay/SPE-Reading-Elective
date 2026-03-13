@@ -229,17 +229,18 @@
 
     - name: "11. Capture memory footprint (RSS) via docker stats"
       shell: |
-        # Take 3 readings 2 s apart after a warm inference, use the median
+        # Take a warm-up inference
         curl -s -X POST http://localhost:{{ item.port }}/predict \
           -H "Content-Type: application/json" \
-          -d '{{ test_payload }}' > /dev/null
+          -d '{{ test_payload | to_json }}' > /dev/null
 
         readings=()
         for i in 1 2 3; do
-          mb=$(docker stats --no-stream --format "{{{{.MemUsage}}}}" \
-                 $(docker ps --filter "publish={{ item.port }}" -q) \
-               | awk -F'/' '{print $1}' \
-               | sed 's/[^0-9.]//g')
+          # Wrap the Docker format string in 'raw' tags
+          mb=$(docker stats --no-stream --format "{% raw %}{{.MemUsage}}{% endraw %}" \
+                $(docker ps --filter "publish={{ item.port }}" -q) \
+              | awk -F'/' '{print $1}' \
+              | sed 's/[^0-9.]//g')
           readings+=("$mb")
           sleep 2
         done
