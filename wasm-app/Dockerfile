@@ -57,57 +57,62 @@
 
 # # Run
 # CMD ["spin", "up", "--listen", "0.0.0.0:8082"]
-
-# ==========================================
-# STAGE 1: BUILDER (Heavy)
-# ==========================================
+# ═══════════════════════════════════════════════════════════════
+# STAGE 1 — BUILDER
+# ═══════════════════════════════════════════════════════════════
 FROM rust:1-slim-bookworm AS builder
-
 WORKDIR /usr/src/app
 
-# Install tools needed for building
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Add WASM Target
+# WASM target
 RUN rustup target add wasm32-wasip1
 
-# Install Spin CLI (v2.7.0)
+# Spin CLI
 RUN curl -fsSL https://developer.fermyon.com/downloads/install.sh | bash -s -- -v v2.7.0 \
     && mv spin /usr/local/bin/
 
-# Prepare Project
-COPY wasm-app/Cargo.toml .
-COPY wasm-app/spin.toml .
-RUN mkdir src && echo "fn main() {}" > src/lib.rs
-
-# Cache Dependencies
+# ── Dependency-cache layer ──────────────────────────────────────
+COPY wasm-app/Cargo.toml wasm-app/Cargo.lock* ./
+RUN mkdir src && echo '#[allow(dead_code)] fn main() {}' > src/lib.rs
 RUN spin build || true
 
-# Real Build
+# ── Real build ──────────────────────────────────────────────────
 COPY wasm-app/src ./src
+COPY wasm-app/spin.toml .
+# Copy model artifacts so spin.toml file-mount resolution works at build time
+COPY model_artifacts/model.onnx   ./model_artifacts/model.onnx
+COPY model_artifacts/scaler.json  ./model_artifacts/scaler.json
 RUN touch src/lib.rs
 RUN RUSTFLAGS="-C target-feature=+simd128" spin build
 
-# ==========================================
-# STAGE 2: RUNNER (Distroless / Hardened)
-# ==========================================
-# Use 'cc' because Spin (written in Rust/Go) needs basic C libraries
+# ═══════════════════════════════════════════════════════════════
+# STAGE 2 — RUNNER  (distroless for minimal CVE surface)
+# ═══════════════════════════════════════════════════════════════
 FROM gcr.io/distroless/cc-debian12
-
 WORKDIR /app
 
-# 1. Copy Spin Binary from Builder
+# Spin binary
 COPY --from=builder /usr/local/bin/spin /usr/local/bin/spin
 
-# 2. Copy Artifacts
-COPY --from=builder /usr/src/app/target/wasm32-wasip1/release/wasm_app.wasm .
-COPY models/mobilenetv2.onnx .
-COPY wasm-app/spin.toml .
+# WASM binary
+COPY --from=builder /usr/src/app/target/wasm32-wasip1/release/wasm_app.wasm ./wasm_app.wasm
 
-# 3. Run (Must use Exec Form [brackets] because there is no shell)
+# spin.toml references model artifacts via the files = [...] mount table;
+# Spin resolves "source" paths relative to where spin.toml lives at runtime.
+# We keep the same relative layout as in the builder.
+COPY --from=builder /usr/src/app/spin.toml            ./spin.toml
+COPY --from=builder /usr/src/app/model_artifacts/model.onnx   ./model_artifacts/model.onnx
+COPY --from=builder /usr/src/app/model_artifacts/scaler.json  ./model_artifacts/scaler.json
+
+EXPOSE 8000
+
+# distroless has no shell, so HEALTHCHECK with CMD is not possible here.
+# Use `docker inspect` or the Ansible health-poll task instead.
+
 ENTRYPOINT ["/usr/local/bin/spin", "up", "--listen", "0.0.0.0:8000"]

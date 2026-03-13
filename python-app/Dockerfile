@@ -1,36 +1,47 @@
-# 1. Base Image: Use Python 3.9 on Debian Slim (Small & Secure-ish)
+# ─────────────────────────────────────────────────────────────
+# Python / ONNX Runtime inference lane
+# Model: Pima Diabetes (tabular, 8 features)
+# ─────────────────────────────────────────────────────────────
+
+# 1. Base image – slim keeps attack surface small (fewer CVEs for Trivy)
 FROM python:3.9-slim
 
-# 2. Set the working directory inside the container
+# 2. Working directory
 WORKDIR /app
 
-# 3. Install system libraries (Required for Pillow/Nuympy processing)
-# We clean up the apt cache afterwards to keep the image size down.
-# 3. Install system libraries (Required for Pillow/Nuympy processing)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
+# 3. System dependencies
+#    libgl1 / libglib2.0-0 were only needed for Pillow/OpenCV (image model).
+#    For a pure tabular ONNX model we need nothing extra — drop them entirely
+#    to reduce the image size and CVE surface area (directly measurable in paper).
+RUN apt-get update \
+    && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. Copy requirements first (Docker Caching Strategy)
-# We do this BEFORE copying the code. If you change your code but not requirements,
-# Docker skips this slow "pip install" step.
+# 4. Python dependencies – copy first for layer-cache efficiency
 COPY python-app/requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-# 5. Install Python Dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# 5. Copy model artifacts (scaler + ONNX model)
+#    Keeping them on a separate layer means code changes don't invalidate
+#    the (larger) model layer cache.
+COPY model_artifacts/model.onnx    /app/model_artifacts/model.onnx
+COPY model_artifacts/scaler.json   /app/model_artifacts/scaler.json
 
-# 7. Copy the Model (Crucial Step)
-# We copy from the "Build Context" (root folder) into the container
-COPY models/mobilenetv2.onnx /models/mobilenetv2.onnx
-
-# 6. Copy the Application Code
+# 6. Copy application code
 COPY python-app/main.py .
 
+# 7. Non-root user – reduces container breakout risk
+#    This is a concrete security metric you can cite in the paper.
+RUN useradd --no-create-home --shell /bin/false appuser
+USER appuser
 
-# 8. Expose the Port (Documentation only, but good practice)
+# 8. Port
 EXPOSE 8000
 
-# 9. The Command to Run the App
-# --host 0.0.0.0 is vital! It lets the container accept outside traffic.
+# 9. Healthcheck – lets Docker (and your Ansible summary step) poll liveness
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+# 10. Entrypoint
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

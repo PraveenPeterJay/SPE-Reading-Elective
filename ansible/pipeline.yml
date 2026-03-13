@@ -1,44 +1,71 @@
 ---
-- name: SPE Research Infrastructure & Benchmark Pipeline
+# =============================================================================
+# SPE Research Infrastructure & Benchmark Pipeline
+# Covers: SBOM, CVE scanning, syscall surface, cold-start, multi-load k6,
+#         memory footprint, accuracy, and a single consolidated summary report.
+# =============================================================================
+- name: SPE Research Benchmark Pipeline
   hosts: localhost
   connection: local
   become: yes
-  vars:
-    k6_version: "0.49.0"
-    trivy_version: "0.49.1"
 
+  vars:
+    workspace:      "/var/lib/jenkins/workspace/SPE-RE"
+    lanes:
+      - name: python
+        port: 8500
+      - name: rust
+        port: 8501
+      - name: wasm
+        port: 8502
+    k6_vus:         [10, 50, 100]        # three load levels for degradation curve
+    k6_duration:    "30s"
+    bench_runs:     5                    # repeat each k6 scenario → mean ± std
+    test_payload:   '{"features":[7,159,64,29,125,27.4,0.294,40]}'
+    batch_payload_file: "{{ workspace }}/test_samples.json"
+
+  # ---------------------------------------------------------------------------
+  # SECTION 0 — Bootstrap / idempotency guards
+  # ---------------------------------------------------------------------------
   tasks:
-    - name: 0. Debug - Check sudo and apt
+
+    - name: "0a. Verify sudo and apt"
       shell: |
         whoami
-        apt-get update 2>&1 || echo "APT FAILED: $?"
-        cat /etc/apt/sources.list | head -5
+        apt-get update 2>&1 | tail -3
       register: debug_out
+      changed_when: false
       ignore_errors: yes
 
-    - name: 0b. Show debug output
+    - name: "0b. Show bootstrap output"
       debug:
         var: debug_out.stdout_lines
 
-    - name: 0c. Fix apt sources if empty
-      shell: |
-        if [ ! -s /etc/apt/sources.list ]; then
-          echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" > /etc/apt/sources.list
-          echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list
-        fi
-      become: yes
+    - name: "0c. Restore apt sources if missing"
+      copy:
+        dest: /etc/apt/sources.list
+        content: |
+          deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+        force: no          # only writes if the file is absent / empty
 
-    - name: 0d. Fix Jenkins repo GPG key
+    - name: "0d. Fix Jenkins repo GPG key (idempotent)"
       shell: |
         wget -O /usr/share/keyrings/jenkins-keyring.asc \
           https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
-        sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable|' \
-          /etc/apt/sources.list.d/jenkins.list
+        if [ -f /etc/apt/sources.list.d/jenkins.list ]; then
+          sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable|' \
+            /etc/apt/sources.list.d/jenkins.list
+        fi
       args:
         creates: /usr/share/keyrings/jenkins-keyring.asc
-      become: yes
 
-    - name: 1. Ensure Prerequisites (Docker & Dependencies)
+  # ---------------------------------------------------------------------------
+  # SECTION 1 — Tool installation
+  # ---------------------------------------------------------------------------
+
+    - name: "1. Install system prerequisites"
       apt:
         name:
           - jq
@@ -50,6 +77,9 @@
           - curl
           - git
           - wget
+          - strace           # syscall profiling
+          - netcat-openbsd   # health polling (nc)
+          - bc               # floating-point arithmetic in shell
         state: present
         update_cache: yes
       register: apt_result
@@ -57,7 +87,7 @@
       delay: 5
       until: apt_result is succeeded
 
-    - name: 2. Install k6 (Performance Testing)
+    - name: "2. Install k6"
       shell: |
         gpg --no-default-keyring \
           --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
@@ -69,59 +99,439 @@
       args:
         creates: /usr/bin/k6
 
-    - name: 3. Install Syft (SBOM Generation)
-      shell: "curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin"
+    - name: "3. Install Syft (SBOM)"
+      shell: >
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh
+        | sh -s -- -b /usr/local/bin
       args:
         creates: /usr/local/bin/syft
 
-    - name: 4. Install Trivy (Vulnerability Scanning)
+    - name: "4a. Install Trivy (CVE scanner)"
       shell: |
         wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-          | gpg --dearmor \
-          | tee /usr/share/keyrings/trivy.gpg > /dev/null
+          | gpg --dearmor | tee /usr/share/keyrings/trivy.gpg > /dev/null
         echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
           | tee /etc/apt/sources.list.d/trivy.list
         apt-get update && apt-get install -y trivy
       args:
         creates: /usr/bin/trivy
 
-    - name: 5. Build and Start All Lanes
-      shell: "docker-compose up --build -d"
-      args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
-      become: no
-
-    - name: 6. Compliance Audit - Generate SBOMs (Syft)
-      shell: "syft secure-{{ item }}:latest -o json > sbom-{{ item }}.json"
-      args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
-      loop: ['python', 'rust', 'wasm']
-      become: no
-
-    - name: 7. Security Audit - Trivy Image Scans with Summary
+    - name: "4b. Build Docker images explicitly (no cache — guaranteed clean)"
       shell: |
-        trivy image --format json -o trivy-{{ item }}.json secure-{{ item }}:latest
-        jq '. + {Summary: ([.Results[]?.Vulnerabilities[]?.Severity // empty] | reduce .[] as $sev ({}; .[$sev] += 1))}' trivy-{{ item }}.json > tmp-{{ item }}.json
-        mv tmp-{{ item }}.json trivy-{{ item }}.json
+        docker build --no-cache \
+          -t secure-{{ item.name }}:latest \
+          -f {{ item.name }}-app/Dockerfile \
+          .
       args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
-      loop: ['python', 'rust', 'wasm']
+        chdir: "{{ workspace }}"
+      loop: "{{ lanes }}"
+      loop_control:
+        label: "Building secure-{{ item.name }}"
+      become: no
+      register: build_result
+ 
+    - name: "4c. Confirm all images exist"
+      shell: docker image inspect secure-{{ item.name }}:latest --format '{{ "{{" }}.Id{{ "}}" }}'
+      loop: "{{ lanes }}"
+      become: no
+      register: image_check
+      failed_when: image_check.rc != 0
+
+  # ---------------------------------------------------------------------------
+  # SECTION 2 — Build & start containers
+  # ---------------------------------------------------------------------------
+
+    - name: "5. Build and start all lanes"
+      shell: docker-compose up --build -d
+      args:
+        chdir: "{{ workspace }}"
+      become: no
+
+    - name: "6. Wait for all lanes to be healthy (up to 60 s)"
+      shell: |
+        for i in $(seq 1 12); do
+          status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:{{ item.port }}/health)
+          [ "$status" = "200" ] && exit 0
+          sleep 5
+        done
+        exit 1
+      loop: "{{ lanes }}"
+      become: no
+      register: health_wait
+      failed_when: health_wait.rc != 0
+
+  # ---------------------------------------------------------------------------
+  # SECTION 3 — Security audit
+  # ---------------------------------------------------------------------------
+
+    - name: "7. Generate SBOMs with Syft (CycloneDX JSON)"
+      shell: >
+        syft secure-{{ item.name }}:latest -o cyclonedx-json
+        > {{ workspace }}/sbom-{{ item.name }}.json
+      loop: "{{ lanes }}"
+      become: no
+
+    - name: "8. Extract SBOM component counts"
+      shell: |
+        count=$(jq '.components | length' {{ workspace }}/sbom-{{ item.name }}.json)
+        echo "{{ item.name }}: $count components" \
+          >> {{ workspace }}/sbom-summary.txt
+      loop: "{{ lanes }}"
+      become: no
+
+    - name: "9. Trivy CVE scan — full JSON + severity summary"
+      shell: |
+        trivy image --format json -o {{ workspace }}/trivy-{{ item.name }}.json \
+          secure-{{ item.name }}:latest
+        jq '{
+          image: "secure-{{ item.name }}",
+          summary: (
+            [.Results[]?.Vulnerabilities[]?.Severity // empty]
+            | reduce .[] as $s ({}; .[$s] += 1)
+          ),
+          total_cves: ([.Results[]?.Vulnerabilities[]? // empty] | length)
+        }' {{ workspace }}/trivy-{{ item.name }}.json \
+          > {{ workspace }}/trivy-summary-{{ item.name }}.json
+      loop: "{{ lanes }}"
       become: no
       ignore_errors: yes
-      # ignore_errors: yes
 
-    # - name: 8. Performance Stress Test - k6
-    #   shell: "k6 run -e PORT={{ item.port }} stress-test.js --summary-export=perf-{{ item.name }}.json"
-    #   args:
-    #     chdir: /var/lib/jenkins/workspace/SPE-RE
-    #   loop:
-    #     - { name: 'python', port: 8500 }
-    #     - { name: 'rust',   port: 8501 }
-    #     - { name: 'wasm',   port: 8502 }
-    #   become: no
+  # ---------------------------------------------------------------------------
+  # SECTION 4 — Syscall surface profiling (novel security metric)
+  # ---------------------------------------------------------------------------
 
-    - name: 9. Stop and Clean Up All Lanes
-      shell: "docker-compose down"
+    - name: "10. Profile syscall surface with strace (single inference)"
+      shell: |
+        strace -c -f \
+          curl -s -X POST http://localhost:{{ item.port }}/predict \
+               -H "Content-Type: application/json" \
+               -d '{{ test_payload }}' \
+          2> {{ workspace }}/strace-raw-{{ item.name }}.txt
+        # Count distinct syscall names (lines with a % sign are the summary table)
+        distinct=$(grep -E '^\s+[0-9]+\.[0-9]+' {{ workspace }}/strace-raw-{{ item.name }}.txt \
+                   | awk '{print $NF}' | sort -u | wc -l)
+        echo "{{ item.name }}: $distinct distinct syscalls" \
+          >> {{ workspace }}/syscall-summary.txt
+        cp {{ workspace }}/strace-raw-{{ item.name }}.txt \
+           {{ workspace }}/strace-{{ item.name }}.txt
+      loop: "{{ lanes }}"
+      become: no
+      ignore_errors: yes    # WASM distroless may limit strace attach
+
+  # ---------------------------------------------------------------------------
+  # SECTION 5 — Memory footprint
+  # ---------------------------------------------------------------------------
+
+    - name: "11. Capture memory footprint (RSS) via docker stats"
+      shell: |
+        # Take 3 readings 2 s apart after a warm inference, use the median
+        curl -s -X POST http://localhost:{{ item.port }}/predict \
+          -H "Content-Type: application/json" \
+          -d '{{ test_payload }}' > /dev/null
+
+        readings=()
+        for i in 1 2 3; do
+          mb=$(docker stats --no-stream --format "{{{{.MemUsage}}}}" \
+                 $(docker ps --filter "publish={{ item.port }}" -q) \
+               | awk -F'/' '{print $1}' \
+               | sed 's/[^0-9.]//g')
+          readings+=("$mb")
+          sleep 2
+        done
+
+        # Sort and take middle value (median of 3)
+        median=$(printf '%s\n' "${readings[@]}" | sort -n | sed -n '2p')
+        echo "{{ item.name }}: ${median} MiB RSS (warm)" \
+          >> {{ workspace }}/memory-summary.txt
+      loop: "{{ lanes }}"
+      become: no
+
+  # ---------------------------------------------------------------------------
+  # SECTION 6 — Cold-start latency
+  # ---------------------------------------------------------------------------
+
+    - name: "12. Measure cold-start latency (stop → start → first request)"
+      shell: |
+        container=$(docker ps --filter "publish={{ item.port }}" -q)
+        docker stop "$container" > /dev/null
+
+        start_ns=$(date +%s%N)
+        docker start "$container" > /dev/null
+
+        # Poll until healthy
+        for i in $(seq 1 30); do
+          status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:{{ item.port }}/health 2>/dev/null)
+          [ "$status" = "200" ] && break
+          sleep 1
+        done
+
+        end_ns=$(date +%s%N)
+        cold_ms=$(( (end_ns - start_ns) / 1000000 ))
+        echo "{{ item.name }}: ${cold_ms} ms" \
+          >> {{ workspace }}/coldstart-summary.txt
+      loop: "{{ lanes }}"
+      become: no
+
+  # ---------------------------------------------------------------------------
+  # SECTION 7 — k6 performance benchmarking (multi-load, repeated runs)
+  #             Produces mean ± std for p99 latency at each VU level
+  # ---------------------------------------------------------------------------
+
+    - name: "13. k6 stress test — {{ item[0].name }} @ {{ item[1] }} VUs (run {{ item[2] }})"
+      shell: |
+        k6 run \
+          -e PORT={{ item[0].port }} \
+          -e VUS={{ item[1] }} \
+          --vus {{ item[1] }} \
+          --duration {{ k6_duration }} \
+          --summary-export {{ workspace }}/k6-{{ item[0].name }}-vu{{ item[1] }}-run{{ item[2] }}.json \
+          {{ workspace }}/stress-test.js
       args:
-        chdir: /var/lib/jenkins/workspace/SPE-RE
+        chdir: "{{ workspace }}"
+      loop: "{{ lanes | product(k6_vus, range(1, bench_runs + 1)) | list }}"
+      loop_control:
+        label: "{{ item[0].name }}-vu{{ item[1] }}-run{{ item[2] }}"
+      become: no
+      ignore_errors: yes
+
+    - name: "14. Aggregate k6 results — mean ± std per lane per VU level"
+      shell: |
+        lane="{{ item[0].name }}"
+        vus="{{ item[1] }}"
+        files="{{ workspace }}/k6-${lane}-vu${vus}-run*.json"
+
+        # Extract p99 http_req_duration from each run
+        p99_values=$(jq -s '[.[].metrics.http_req_duration.values."p(99)"]' $files)
+        mean=$(echo "$p99_values" | jq 'add/length')
+        std=$(echo  "$p99_values" | jq 'sqrt(map(. - '"$mean"') | map(. * .) | add / length)')
+        min=$(echo  "$p99_values" | jq 'min')
+        max=$(echo  "$p99_values" | jq 'max')
+
+        echo "${lane},${vus},${mean},${std},${min},${max}" \
+          >> {{ workspace }}/k6-aggregated.csv
+      loop: "{{ lanes | product(k6_vus) | list }}"
+      loop_control:
+        label: "{{ item[0].name }}-vu{{ item[1] }}"
+      become: no
+
+  # ---------------------------------------------------------------------------
+  # SECTION 8 — Accuracy (batch inference over test set)
+  # ---------------------------------------------------------------------------
+
+    - name: "15. Batch accuracy check"
+      shell: |
+        result=$(curl -s -X POST http://localhost:{{ item.port }}/batch \
+          -H "Content-Type: application/json" \
+          --data-binary @{{ batch_payload_file }})
+        acc=$(echo "$result" | jq '.accuracy // "N/A"')
+        echo "{{ item.name }}: accuracy=${acc}" \
+          >> {{ workspace }}/accuracy-summary.txt
+      loop: "{{ lanes }}"
+      become: no
+      ignore_errors: yes
+
+  # ---------------------------------------------------------------------------
+  # SECTION 9 — Docker image size
+  # ---------------------------------------------------------------------------
+
+    - name: "16. Record Docker image sizes"
+      shell: |
+        size=$(docker image inspect secure-{{ item.name }}:latest \
+               --format '{{{{.Size}}}}')
+        size_mb=$(echo "scale=2; $size/1048576" | bc)
+        echo "{{ item.name }}: ${size_mb} MB" \
+          >> {{ workspace }}/imagesize-summary.txt
+      loop: "{{ lanes }}"
+      become: no
+
+  # ---------------------------------------------------------------------------
+  # SECTION 10 — Consolidated summary report
+  # ---------------------------------------------------------------------------
+
+    - name: "17. Generate consolidated research summary (summary.json)"
+      shell: |
+        cd {{ workspace }}
+
+        # Helper: read a summary txt file into a jq-compatible object
+        # Format expected: "lane: value"
+        txt_to_obj() {
+          local f="$1"
+          [ -f "$f" ] || echo "{}" && return
+          jq -Rn '[inputs | split(": ") | {(.[0]): .[1]}] | add // {}' < "$f"
+        }
+
+        python3 - <<'PYEOF'
+        import json, csv, os
+
+        ws = "{{ workspace }}"
+
+        def read_kv(path):
+            """Parse 'lane: value' text files into a dict."""
+            out = {}
+            try:
+                for line in open(path):
+                    line = line.strip()
+                    if ': ' in line:
+                        k, v = line.split(': ', 1)
+                        out[k.strip()] = v.strip()
+            except FileNotFoundError:
+                pass
+            return out
+
+        def read_trivy(lane):
+            path = f"{ws}/trivy-summary-{lane}.json"
+            try:
+                return json.load(open(path))
+            except Exception:
+                return {}
+
+        def read_k6_csv(path):
+            rows = []
+            try:
+                with open(path) as f:
+                    reader = csv.DictReader(f,
+                        fieldnames=["lane","vus","mean_p99","std_p99","min_p99","max_p99"])
+                    for r in reader:
+                        rows.append(r)
+            except FileNotFoundError:
+                pass
+            return rows
+
+        def read_sbom_count(lane):
+            path = f"{ws}/sbom-{lane}.json"
+            try:
+                data = json.load(open(path))
+                return len(data.get("components", []))
+            except Exception:
+                return None
+
+        lanes = ["python", "rust", "wasm"]
+
+        sbom_counts   = {l: read_sbom_count(l) for l in lanes}
+        coldstart     = read_kv(f"{ws}/coldstart-summary.txt")
+        memory        = read_kv(f"{ws}/memory-summary.txt")
+        syscalls      = read_kv(f"{ws}/syscall-summary.txt")
+        accuracy      = read_kv(f"{ws}/accuracy-summary.txt")
+        imagesizes    = read_kv(f"{ws}/imagesize-summary.txt")
+        k6_rows       = read_k6_csv(f"{ws}/k6-aggregated.csv")
+
+        # Structure k6 results per lane
+        k6_by_lane = {l: {} for l in lanes}
+        for row in k6_rows:
+            lane = row["lane"]
+            vus  = row["vus"]
+            if lane in k6_by_lane:
+                k6_by_lane[lane][f"vu{vus}"] = {
+                    "mean_p99_ms": row["mean_p99"],
+                    "std_p99_ms":  row["std_p99"],
+                    "min_p99_ms":  row["min_p99"],
+                    "max_p99_ms":  row["max_p99"],
+                }
+
+        summary = {
+            "meta": {
+                "dataset":    "Pima Indians Diabetes",
+                "model":      "sklearn → ONNX (LogisticRegression / RFC)",
+                "k6_runs_per_scenario": {{ bench_runs }},
+                "k6_duration": "{{ k6_duration }}",
+                "k6_vu_levels": {{ k6_vus }},
+            },
+            "lanes": {}
+        }
+
+        for lane in lanes:
+            trivy = read_trivy(lane)
+            summary["lanes"][lane] = {
+                "security": {
+                    "sbom_component_count": sbom_counts.get(lane),
+                    "cve_total":            trivy.get("total_cves"),
+                    "cve_by_severity":      trivy.get("summary", {}),
+                    "distinct_syscalls":    syscalls.get(lane),
+                },
+                "performance": {
+                    "cold_start_ms":   coldstart.get(lane),
+                    "memory_warm_mib": memory.get(lane),
+                    "image_size_mb":   imagesizes.get(lane),
+                    "k6_latency":      k6_by_lane.get(lane, {}),
+                },
+                "accuracy": accuracy.get(lane),
+            }
+
+        out_path = f"{ws}/summary.json"
+        with open(out_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        # Also emit a human-readable markdown table
+        md_lines = [
+            "# SPE Benchmark Summary\n",
+            "## Security Metrics\n",
+            "| Lane | SBOM Components | Total CVEs | CRITICAL | HIGH | Syscalls |",
+            "|------|----------------|-----------|----------|------|----------|",
+        ]
+        for lane in lanes:
+            s  = summary["lanes"][lane]["security"]
+            sev = s.get("cve_by_severity") or {}
+            md_lines.append(
+                f"| {lane} | {s.get('sbom_component_count','?')} "
+                f"| {s.get('cve_total','?')} "
+                f"| {sev.get('CRITICAL','0')} "
+                f"| {sev.get('HIGH','0')} "
+                f"| {s.get('distinct_syscalls','?')} |"
+            )
+
+        md_lines += [
+            "\n## Performance Metrics (p99 latency ms, mean ± std)\n",
+            "| Lane | Cold-start ms | Mem (MiB) | Image MB | 10 VU | 50 VU | 100 VU |",
+            "|------|--------------|-----------|----------|-------|-------|--------|",
+        ]
+        for lane in lanes:
+            p  = summary["lanes"][lane]["performance"]
+            kl = p.get("k6_latency", {})
+            def fmt(vu):
+                d = kl.get(f"vu{vu}", {})
+                m = d.get("mean_p99_ms", "?")
+                s = d.get("std_p99_ms",  "?")
+                return f"{m}±{s}"
+            md_lines.append(
+                f"| {lane} | {p.get('cold_start_ms','?')} "
+                f"| {p.get('memory_warm_mib','?')} "
+                f"| {p.get('image_size_mb','?')} "
+                f"| {fmt(10)} | {fmt(50)} | {fmt(100)} |"
+            )
+
+        md_lines += [
+            "\n## Accuracy\n",
+            "| Lane | Accuracy |",
+            "|------|----------|",
+        ]
+        for lane in lanes:
+            md_lines.append(f"| {lane} | {summary['lanes'][lane].get('accuracy','?')} |")
+
+        with open(f"{ws}/summary.md", "w") as f:
+            f.write("\n".join(md_lines))
+
+        print("Summary written to summary.json and summary.md")
+        PYEOF
+      args:
+        chdir: "{{ workspace }}"
+      become: no
+
+    - name: "18. Print summary to Ansible output"
+      shell: "cat {{ workspace }}/summary.md"
+      register: summary_out
+      become: no
+      changed_when: false
+
+    - name: "18b. Show summary"
+      debug:
+        var: summary_out.stdout_lines
+
+  # ---------------------------------------------------------------------------
+  # SECTION 11 — Teardown
+  # ---------------------------------------------------------------------------
+
+    - name: "19. Stop and remove all containers"
+      shell: docker-compose down
+      args:
+        chdir: "{{ workspace }}"
       become: no

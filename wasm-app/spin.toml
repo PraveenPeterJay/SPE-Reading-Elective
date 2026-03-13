@@ -1,17 +1,21 @@
 spin_manifest_version = 2
 
 [application]
-name = "wasm-app"
+name    = "wasm-app"
 version = "0.1.0"
 
 [[trigger.http]]
-route = "/..."
+route     = "/..."
 component = "wasm-app"
 
 [component.wasm-app]
-# FIX: Point to the file in the root folder (where Docker puts it)
 source = "wasm_app.wasm"
-files = ["mobilenetv2.onnx"]
+# Mount both model artifacts into the WASI sandbox filesystem root
+# lib.rs reads them as "model.onnx" and "scaler.json" (no path prefix)
+files = [
+    { source = "model_artifacts/model.onnx",  destination = "model.onnx"  },
+    { source = "model_artifacts/scaler.json", destination = "scaler.json" },
+]
 
 [component.wasm-app.build]
 command = "cargo build --target wasm32-wasip1 --release"

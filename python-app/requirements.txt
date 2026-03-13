@@ -3,4 +3,4 @@ uvicorn
 python-multipart
 onnxruntime
 numpy
-Pillow
+psutil

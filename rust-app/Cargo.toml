@@ -4,27 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# 1. The Web Server (Matches FastAPI)
-# Actix-web is one of the fastest web frameworks in the world.
-actix-web = "4"
-actix-multipart = "0.6"  # Handles file uploads
+# Web framework
+actix-web  = "4"
 
-# 2. The Brain Engine (Matches onnxruntime)
-# 'ort' is a safe Rust wrapper around the Microsoft ONNX Runtime C++ library.
-ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
+# ONNX Runtime (tabular only — no image feature needed)
+ort        = { version = "2.0.0-rc.11", features = ["ndarray"] }
 
-# 3. The Math Wizard (Matches NumPy)
-# ndarray lets us handle multi-dimensional matrices.
-ndarray = "0.15"
+# Matrix math (replaces NumPy)
+ndarray    = "0.15"
 
-# 4. The Photographer (Matches Pillow)
-# Opens and resizes images.
-image = "0.24"
-
-# 5. Utilities
-futures-util = "0.3" # Helps with async file uploads
-uuid = { version = "1.0", features = ["v4"] } # For temp filenames
-env_logger = "0.10" # Logging
-log = "0.4"
+# JSON serialisation
+serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-time = "=0.3.36"
+
+# Async runtime (pulled in by actix; pin to avoid resolver conflicts)
+tokio      = { version = "1", features = ["full"] }
+
+# Logging
+env_logger = "0.10"
+log        = "0.4"
+
+# Pin time to avoid ORT resolver conflict (keep from original)
+time       = "=0.3.36"
+
+# Removed: actix-multipart, image, futures-util, uuid
+# — none are needed for a tabular JSON API
