@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY lanes/rust/Cargo.toml ./Cargo.toml
+COPY lanes/rust/Cargo.toml lanes/rust/Cargo.lock ./
 COPY lanes/rust/src         ./src
 
 # ort 2.x load-dynamic: fetch ORT shared library during build
