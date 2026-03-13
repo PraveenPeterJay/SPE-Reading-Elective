@@ -162,7 +162,7 @@ fn infer(features: &[f32]) -> anyhow::Result<(i64, f64, f64)> {
 // ─────────────────────────────────────────────
 #[http_component]
 fn handle_request(req: Request) -> anyhow::Result<impl IntoResponse> {
-    match (req.method(), req.uri().path()) {
+    match (req.method(), req.path()) {
         (&Method::Post, "/predict") => handle_predict(req),
         (&Method::Post, "/batch")   => handle_batch(req),
         (&Method::Get,  "/health")  => handle_health(),

@@ -116,10 +116,9 @@
       args:
         creates: /usr/bin/trivy
 
-    - name: "4b. Build Docker images explicitly (no cache — guaranteed clean)"
+    - name: "4b. Build Docker images"
       shell: |
-        docker build --no-cache \
-          -t secure-{{ item.name }}:latest \
+        docker build -t secure-{{ item.name }}:latest \
           -f {{ item.name }}-app/Dockerfile \
           .
       args:
