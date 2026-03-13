@@ -7,16 +7,12 @@ use axum::{
     Router,
 };
 use ndarray::Array2;
-use ort::{Environment, ExecutionProvider, Session, SessionBuilder, Value};
+use ort::{session::Session, value::Tensor};
 use serde::{Deserialize, Serialize};
 use std::{fs, sync::Arc, time::Instant};
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
-struct PredictRequest {
-    features: Vec<f32>,
-}
+struct PredictRequest { features: Vec<f32> }
 
 #[derive(Serialize)]
 struct PredictResponse {
@@ -28,26 +24,12 @@ struct PredictResponse {
 }
 
 #[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    lane:   &'static str,
-}
+struct HealthResponse { status: &'static str, lane: &'static str }
 
 #[derive(Deserialize)]
-struct ScalerMeta {
-    mean_:  Vec<f32>,
-    scale_: Vec<f32>,
-}
+struct ScalerMeta { mean_: Vec<f32>, scale_: Vec<f32> }
 
-// ── App state ─────────────────────────────────────────────────────────────────
-
-struct AppState {
-    session: Session,
-    mean:    Vec<f32>,
-    scale:   Vec<f32>,
-}
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
+struct AppState { session: Session, mean: Vec<f32>, scale: Vec<f32> }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok", lane: "rust" })
@@ -57,13 +39,10 @@ async fn predict(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PredictRequest>,
 ) -> Result<Json<PredictResponse>, StatusCode> {
-    if req.features.len() != 8 {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
-    }
+    if req.features.len() != 8 { return Err(StatusCode::UNPROCESSABLE_ENTITY); }
 
     let t0 = Instant::now();
 
-    // Normalise: (x - mean) / scale
     let normed: Vec<f32> = req.features.iter().enumerate()
         .map(|(i, &v)| (v - state.mean[i]) / state.scale[i])
         .collect();
@@ -71,18 +50,21 @@ async fn predict(
     let arr = Array2::from_shape_vec((1, 8), normed)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let input = Value::from_array(arr)
+    let input_tensor = Tensor::from_array(arr)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let outputs = state.session.run(ort::inputs!["features" => input]
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+    let outputs = state.session
+        .run(ort::inputs!["features" => input_tensor]
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let logit: f64 = outputs["logit"]
+    let logit_view = outputs["logit"]
         .try_extract_tensor::<f32>()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .view()[[0]]
-        as f64;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let logit = logit_view.view().iter().next()
+        .copied()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)? as f64;
 
     let prob = 1.0 / (1.0 + (-logit).exp());
     let pred = if prob >= 0.5 { 1 } else { 0 };
@@ -92,27 +74,16 @@ async fn predict(
         prediction:  pred,
         probability: (prob * 1_000_000.0).round() / 1_000_000.0,
         lane:        "rust",
-        runtime:     "onnxruntime-rs 1.17.3",
+        runtime:     "ort 2.0.0-rc.10 (load-dynamic)",
         latency_ms:  (ms * 1000.0).round() / 1000.0,
     }))
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("warn").init();
 
-    let env = Arc::new(
-        Environment::builder()
-            .with_name("spe-rust")
-            .with_execution_providers([ExecutionProvider::CPU(Default::default())])
-            .build()?
-    );
-
-    let session = SessionBuilder::new(&env)?
+    let session = Session::builder()?
         .with_model_from_file("/app/model.onnx")?;
 
     let raw: ScalerMeta = serde_json::from_str(
@@ -131,7 +102,7 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8501").await?;
-    tracing::info!("Rust lane listening on :8501");
+    tracing::warn!("Rust lane listening on :8501");
     axum::serve(listener, app).await?;
     Ok(())
 }
