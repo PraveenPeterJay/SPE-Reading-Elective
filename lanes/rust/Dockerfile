@@ -3,7 +3,7 @@
 # ort 2.x with load-dynamic: downloads ORT shared lib at build time via ort-sys
 # ─────────────────────────────────────────────────────────────────────────────
 
-FROM rust:1.78-slim AS builder
+FROM rust:latest AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev cmake curl \
