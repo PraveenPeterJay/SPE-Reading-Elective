@@ -142,11 +142,16 @@
     # ════════════════════════════════════════════════════════
 
     - name: Collect image size
-      shell: |
-        SIZE=$(docker image inspect secure-{{ item }}:latest \
-          --format '{{"{{"}}(.Size){{"}}"}}')
-        echo "{\"lane\":\"{{ item }}\",\"image_size_bytes\":$SIZE}" \
-          > {{ results_dir }}/{{ run_id }}/image-size-{{ item }}.json
+      shell: >
+        python3 -c "
+        import subprocess, json;
+        out = subprocess.check_output(['docker','image','inspect','secure-{{ item }}:latest']).decode();
+        data = json.loads(out);
+        size = data[0]['Size'];
+        import pathlib, json as j;
+        pathlib.Path('{{ results_dir }}/{{ run_id }}/image-size-{{ item }}.json').write_text(
+          j.dumps({'lane':'{{ item }}','image_size_bytes':size}))
+        "
       loop: "{{ lane_names }}"
       become: no
 
@@ -216,65 +221,27 @@
       ignore_errors: yes
       become: no
 
+    - name: Copy syscall profiling script to workspace
+      copy:
+        src: "{{ workspace }}/syscall_profile.sh"
+        dest: /tmp/syscall_profile.sh
+        mode: '0755'
+      become: yes
+
     - name: Syscall surface analysis — profile inference under strace
-      shell: |
-        set -e
-        LANE="{{ item.name }}"
-        PORT="{{ item.port }}"
-        CID=$(docker ps -qf "name={{ item.container }}")
-
-        # Attach strace to the running container process for 10 seconds
-        # while sending inference requests, then count unique syscalls
-        docker exec "$CID" sh -c \
-          'cat /proc/1/status | grep -E "^(Name|Pid|Threads):"' \
-          > {{ results_dir }}/{{ run_id }}/proc-info-${LANE}.txt 2>/dev/null || true
-
-        # Run strace via nsenter into the container's PID namespace
-        PID=$(docker inspect --format '{{"{{"}}.State.Pid{{"}}"}}' "$CID")
-
-        # Warm the inference endpoint first
-        for i in $(seq 5); do
-          curl -s -X POST http://localhost:${PORT}/predict \
-            -H 'Content-Type: application/json' \
-            -d '{"features":[6,148,72,35,169,33.6,0.627,50]}' > /dev/null
-        done
-
-        # Collect syscall trace for 8 seconds under load
-        timeout 8 nsenter -t $PID -m -u -i -n -p -- \
-          strace -p 1 -f -e trace=all -o \
-          {{ results_dir }}/{{ run_id }}/strace-${LANE}.txt 2>/dev/null &
-        STRACE_PID=$!
-
-        # Drive inference requests during trace window
-        for i in $(seq 20); do
-          curl -s -X POST http://localhost:${PORT}/predict \
-            -H 'Content-Type: application/json' \
-            -d '{"features":[6,148,72,35,169,33.6,0.627,50]}' > /dev/null
-        done
-
-        wait $STRACE_PID 2>/dev/null || true
-
-        # Extract unique syscall names and count
-        STRACE_FILE="{{ results_dir }}/{{ run_id }}/strace-${LANE}.txt"
-        if [ -f "$STRACE_FILE" ] && [ -s "$STRACE_FILE" ]; then
-          SYSCALLS=$(grep -oP '^[a-z_]+(?=\()' "$STRACE_FILE" | sort -u | wc -l)
-          SYSCALL_LIST=$(grep -oP '^[a-z_]+(?=\()' "$STRACE_FILE" | sort -u | tr '\n' ',' | sed 's/,$//')
-        else
-          # Fallback: use /proc seccomp info
-          SYSCALLS="N/A"
-          SYSCALL_LIST="strace_unavailable"
-        fi
-
-        echo "{\"lane\":\"${LANE}\",\"unique_syscalls\":\"${SYSCALLS}\",\"syscall_list\":\"${SYSCALL_LIST}\"}" \
-          > {{ results_dir }}/{{ run_id }}/syscall-{{ item.name }}.json
-
-        echo "Syscall surface for ${LANE}: ${SYSCALLS} unique syscalls"
+      shell: >
+        bash /tmp/syscall_profile.sh
+        "{{ item.name }}"
+        "{{ item.port }}"
+        "{{ item.container }}"
+        "{{ results_dir }}/{{ run_id }}"
       loop: "{{ lanes }}"
       loop_control:
         label: "{{ item.name }}"
       ignore_errors: yes
       register: syscall_results
       become: yes
+
 
     # ════════════════════════════════════════════════════════
     # 4. PERFORMANCE — k6 AT THREE LOAD LEVELS
