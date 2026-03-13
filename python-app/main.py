@@ -16,8 +16,8 @@ app = FastAPI(title="Diabetes Risk Inference – Python/ONNX")
 # ─────────────────────────────────────────────
 # 2. Load Model & Scaler (once at startup)
 # ─────────────────────────────────────────────
-MODEL_PATH  = os.getenv("MODEL_PATH",  "../model_artifacts/model.onnx")
-SCALER_PATH = os.getenv("SCALER_PATH", "../model_artifacts/scaler.json")
+MODEL_PATH  = os.getenv("MODEL_PATH",  "/app/model_artifacts/model.onnx")
+SCALER_PATH = os.getenv("SCALER_PATH", "/app/model_artifacts/scaler.json")
 
 print("Loading ONNX model …")
 ort_session = ort.InferenceSession(MODEL_PATH)

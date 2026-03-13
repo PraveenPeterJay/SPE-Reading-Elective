@@ -17,6 +17,8 @@ services:
 
   rust-lane:
     image: secure-rust:latest
+    environment:
+      - RUST_BACKTRACE=1
     ports: ["8501:8000"]
     restart: unless-stopped
     healthcheck:

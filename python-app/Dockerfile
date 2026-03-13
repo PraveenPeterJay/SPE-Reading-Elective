@@ -33,7 +33,8 @@ COPY python-app/main.py .
 
 # 7. Non-root user – reduces container breakout risk
 #    This is a concrete security metric you can cite in the paper.
-RUN useradd --no-create-home --shell /bin/false appuser
+RUN useradd --no-create-home --shell /bin/false appuser && \
+    chown -R appuser:appuser /app  
 USER appuser
 
 # 8. Port
