@@ -117,11 +117,32 @@
     # 2. BUILD
     # ════════════════════════════════════════════════════════
 
-    - name: Build all lanes
-      shell: docker-compose up --build -d
+    - name: Stop and remove any orphan containers from previous runs
+      shell: docker-compose down --remove-orphans 2>/dev/null || true
       args:
         chdir: "{{ workspace }}"
       become: no
+
+    - name: Verify model artifacts exist before building
+      stat:
+        path: "{{ workspace }}/model_artifacts/{{ item }}"
+      loop:
+        - model.onnx
+        - scaler.json
+      register: artifact_check
+      failed_when: not artifact_check.stat.exists
+
+    - name: Build all lanes
+      shell: docker-compose up --build -d --remove-orphans
+      args:
+        chdir: "{{ workspace }}"
+      become: no
+      register: build_result
+
+    - name: Show build output if failed
+      debug:
+        var: build_result.stderr_lines
+      when: build_result.rc is defined and build_result.rc != 0
 
     - name: Wait for all lanes to pass healthcheck
       uri:
@@ -223,7 +244,7 @@
 
     - name: Copy syscall profiling script to workspace
       copy:
-        src: "{{ workspace }}/syscall_profile.sh"
+        src: "{{ workspace }}/scripts/syscall_profile.sh"
         dest: /tmp/syscall_profile.sh
         mode: '0755'
       become: yes
