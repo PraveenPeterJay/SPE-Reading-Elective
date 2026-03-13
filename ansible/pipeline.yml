@@ -136,6 +136,12 @@
       register: image_check
       failed_when: image_check.rc != 0
 
+    - name: "4d. Stop and remove all containers from previous builds (if any)"
+      shell: docker-compose down
+      args:
+        chdir: "{{ workspace }}"
+      become: no
+
   # ---------------------------------------------------------------------------
   # SECTION 2 — Build & start containers
   # ---------------------------------------------------------------------------
