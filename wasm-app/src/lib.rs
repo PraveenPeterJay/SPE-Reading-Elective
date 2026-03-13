@@ -1,6 +1,8 @@
 use spin_sdk::http::{IntoResponse, Request, Response, Method};
 use spin_sdk::http_component;
 use tract_onnx::prelude::*;
+// tract re-exports ndarray internally — access Array2 through it, not a separate crate
+use tract_onnx::prelude::tract_ndarray::Array2;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,7 +113,7 @@ struct BatchResponse {
 // ─────────────────────────────────────────────
 // 4. Pre-processing (StandardScaler)
 // ─────────────────────────────────────────────
-fn preprocess(features: &[f32]) -> anyhow::Result<tract_ndarray::Array2<f32>> {
+fn preprocess(features: &[f32]) -> anyhow::Result<Array2<f32>> {
     if features.len() != N_FEATURES {
         anyhow::bail!("Expected {} features, got {}", N_FEATURES, features.len());
     }
@@ -119,7 +121,7 @@ fn preprocess(features: &[f32]) -> anyhow::Result<tract_ndarray::Array2<f32>> {
     let scaled: Vec<f32> = features.iter().enumerate()
         .map(|(i, &v)| (v - scaler.mean[i]) / scaler.scale[i])
         .collect();
-    tract_ndarray::Array2::from_shape_vec((1, N_FEATURES), scaled)
+    Array2::from_shape_vec((1, N_FEATURES), scaled)
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
