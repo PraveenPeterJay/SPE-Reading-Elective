@@ -1,29 +1,54 @@
+version: "3.9"
+
 services:
-  # --- Your AI Lanes ---
-  python-lane:
+  secure-python:
+    build:
+      context: .
+      dockerfile: lanes/python/Dockerfile
     image: secure-python:latest
-    ports: ["8500:8000"]
-  
-  rust-lane:
+    container_name: spe-python
+    ports: ["8500:8500"]
+    restart: unless-stopped
+    cpus: "1.0"
+    mem_limit: "512m"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [spe-net]
+
+  secure-rust:
+    build:
+      context: .
+      dockerfile: lanes/rust/Dockerfile
     image: secure-rust:latest
-    ports: ["8501:8000"]
+    container_name: spe-rust
+    ports: ["8501:8501"]
+    restart: unless-stopped
+    cpus: "1.0"
+    mem_limit: "256m"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [spe-net]
 
-  wasm-lane:
+  secure-wasm:
+    build:
+      context: .
+      dockerfile: lanes/wasm/Dockerfile
     image: secure-wasm:latest
-    ports: ["8502:8000"]
+    container_name: spe-wasm
+    ports: ["8502:8502"]
+    restart: unless-stopped
+    cpus: "1.0"
+    mem_limit: "512m"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [spe-net]
 
-  # --- Monitoring Stack ---
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    ports: ["8090:8080"]
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-
-  prometheus:
-    image: prom/prometheus:latest
-    ports: ["9090:9090"]
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+networks:
+  spe-net:
+    driver: bridge

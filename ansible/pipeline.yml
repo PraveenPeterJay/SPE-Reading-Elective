@@ -1,45 +1,65 @@
 ---
-- name: SPE Research Infrastructure & Benchmark Pipeline
+# SPE Research Pipeline — Rigorous Edition
+# Security metrics: CVE count+severity, SBOM component count, syscall surface area, image size
+# Performance metrics: k6 at 3 load levels (low/mid/high), cold-start latency (5 trials),
+#                      per-run aggregation + multi-run variance tracking
+
+- name: SPE Research — Security & Performance Benchmark
   hosts: localhost
   connection: local
   become: yes
 
   vars:
     workspace: /var/lib/jenkins/workspace/SPE-RE
-    lanes: [python, rust, wasm]
-    lane_ports:
-      python: 8500
-      rust:   8501
-      wasm:   8502
+    lanes:
+      - name: python
+        port: 8500
+        container: spe-python
+      - name: rust
+        port: 8501
+        container: spe-rust
+      - name: wasm
+        port: 8502
+        container: spe-wasm
+    lane_names:   [python, rust, wasm]
+    load_profiles: [low, mid, high]
+    coldstart_trials: 5
+    results_dir: "{{ workspace }}/results"
+    run_id: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
 
-    # ── 0. BOOTSTRAP ────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # 0. BOOTSTRAP
+    # ════════════════════════════════════════════════════════
 
-    - name: Ensure apt sources are present
+    - name: Ensure apt sources exist
       shell: |
-        if [ ! -s /etc/apt/sources.list ]; then
-          echo "deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse" \
-            > /etc/apt/sources.list
-          echo "deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse" \
-            >> /etc/apt/sources.list
-        fi
+        [ -s /etc/apt/sources.list ] || cat > /etc/apt/sources.list << 'EOF'
+        deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+        deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+        EOF
 
     - name: Fix Jenkins repo GPG key
       shell: |
-        wget -O /usr/share/keyrings/jenkins-keyring.asc \
+        wget -qO /usr/share/keyrings/jenkins-keyring.asc \
           https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
-        sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
-          https://pkg.jenkins.io/debian-stable|' /etc/apt/sources.list.d/jenkins.list
+        sed -i 's|deb https://pkg.jenkins.io/debian-stable|deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable|' \
+          /etc/apt/sources.list.d/jenkins.list 2>/dev/null || true
       args:
         creates: /usr/share/keyrings/jenkins-keyring.asc
 
-    # ── 1. SYSTEM DEPENDENCIES ──────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # 1. SYSTEM DEPENDENCIES
+    # ════════════════════════════════════════════════════════
 
     - name: Install system packages
       apt:
         name:
           - jq
+          - python3
+          - python3-pip
+          - strace
           - apt-transport-https
           - ca-certificates
           - gnupg
@@ -48,21 +68,20 @@
           - curl
           - git
           - wget
+          - bc
         state: present
         update_cache: yes
       retries: 3
       delay: 5
-      until: result is succeeded
-      register: result
+      until: pkg_result is succeeded
+      register: pkg_result
 
-    # ── 2. SECURITY & PERFORMANCE TOOLS ─────────────────────────────────────
-
-    - name: Install k6 (performance testing)
+    - name: Install k6
       shell: |
         gpg --no-default-keyring \
           --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
           --keyserver hkp://keyserver.ubuntu.com:80 \
-          --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69 2>/dev/null
         echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
           https://dl.k6.io/deb stable main" | tee /etc/apt/sources.list.d/k6.list
         apt-get update && apt-get install -y k6
@@ -87,196 +106,456 @@
       args:
         creates: /usr/bin/trivy
 
-    # ── 3. BUILD ─────────────────────────────────────────────────────────────
+    - name: Create results directory for this run
+      file:
+        path: "{{ results_dir }}/{{ run_id }}"
+        state: directory
+        mode: '0755'
+      become: no
 
-    - name: Build and start all lanes
+    # ════════════════════════════════════════════════════════
+    # 2. BUILD
+    # ════════════════════════════════════════════════════════
+
+    - name: Build all lanes
       shell: docker-compose up --build -d
       args:
         chdir: "{{ workspace }}"
       become: no
 
-    # - name: Wait for all lanes to be ready
-    #   uri:
-    #     url: "http://localhost:{{ lane_ports[item] }}/health"
-    #     status_code: 200
-    #   loop: "{{ lanes }}"
-    #   retries: 10
-    #   delay: 3
-    #   register: health_check
-    #   until: health_check is succeeded
-    #   become: no
+    - name: Wait for all lanes to pass healthcheck
+      uri:
+        url: "http://localhost:{{ item.port }}/health"
+        status_code: 200
+        timeout: 5
+      loop: "{{ lanes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      retries: 15
+      delay: 3
+      register: _health
+      until: _health is succeeded
+      become: no
 
-    # ── 4. COMPLIANCE & SECURITY AUDIT ──────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # 3. SECURITY AUDIT
+    # ════════════════════════════════════════════════════════
 
-    - name: Generate SBOMs (Syft / CycloneDX)
+    - name: Collect image size
+      shell: |
+        SIZE=$(docker image inspect secure-{{ item }}:latest \
+          --format '{{"{{"}}(.Size){{"}}"}}')
+        echo "{\"lane\":\"{{ item }}\",\"image_size_bytes\":$SIZE}" \
+          > {{ results_dir }}/{{ run_id }}/image-size-{{ item }}.json
+      loop: "{{ lane_names }}"
+      become: no
+
+    - name: Generate SBOM with Syft (CycloneDX JSON)
       shell: >
         syft secure-{{ item }}:latest -o cyclonedx-json
-        > {{ workspace }}/sbom-{{ item }}.json
-      loop: "{{ lanes }}"
+        > {{ results_dir }}/{{ run_id }}/sbom-{{ item }}.json
+      loop: "{{ lane_names }}"
       become: no
 
-    - name: Collect image size metrics
-      shell: >
-        docker image inspect secure-{{ item }}:latest
-        --format '{"image":"secure-{{ item }}","size_bytes":{{"{{"}}".Size{{"}}"}}}'
-        > {{ workspace }}/image-size-{{ item }}.json
-      loop: "{{ lanes }}"
-      become: no
-
-    - name: Trivy vulnerability scan (JSON + severity summary)
+    - name: Extract SBOM component and package-manager counts
       shell: |
-        trivy image --format json -o {{ workspace }}/trivy-{{ item }}.json \
+        python3 << 'EOF'
+        import json, sys
+
+        lane = "{{ item }}"
+        path = "{{ results_dir }}/{{ run_id }}/sbom-{}.json".format(lane)
+        with open(path) as f:
+            sbom = json.load(f)
+
+        comps = sbom.get("components", [])
+        by_type = {}
+        for c in comps:
+            t = c.get("type", "unknown")
+            by_type[t] = by_type.get(t, 0) + 1
+
+        licenses = set()
+        for c in comps:
+            for lic in c.get("licenses", []):
+                lic_id = (lic.get("license") or {}).get("id", "")
+                if lic_id: licenses.add(lic_id)
+
+        out = {
+            "lane": lane,
+            "total_components": len(comps),
+            "by_type": by_type,
+            "unique_licenses": len(licenses),
+        }
+        out_path = path.replace("sbom-", "sbom-summary-")
+        with open(out_path, "w") as f:
+            json.dump(out, f, indent=2)
+        print(json.dumps(out))
+        EOF
+      loop: "{{ lane_names }}"
+      register: sbom_summaries
+      become: no
+
+    - name: Trivy scan — CRITICAL and HIGH CVEs (JSON)
+      shell: |
+        trivy image \
+          --format json \
+          --severity CRITICAL,HIGH,MEDIUM,LOW \
+          --ignore-unfixed \
+          -o {{ results_dir }}/{{ run_id }}/trivy-{{ item }}.json \
           secure-{{ item }}:latest
-        jq '. + {Summary: ([.Results[]?.Vulnerabilities[]?.Severity // empty]
-          | reduce .[] as $s ({}; .[$s] += 1))}' \
-          {{ workspace }}/trivy-{{ item }}.json > /tmp/trivy-{{ item }}.json
-        mv /tmp/trivy-{{ item }}.json {{ workspace }}/trivy-{{ item }}.json
-      loop: "{{ lanes }}"
+
+        jq '{
+          lane: "{{ item }}",
+          Summary: ([.Results[]?.Vulnerabilities[]?.Severity // empty]
+            | reduce .[] as $s ({}; .[$s] += 1)),
+          CVE_list: [.Results[]?.Vulnerabilities[]?
+            | {id:.VulnerabilityID, severity:.Severity,
+               pkg:.PkgName, fixed:.FixedVersion}]
+        }' {{ results_dir }}/{{ run_id }}/trivy-{{ item }}.json \
+          > {{ results_dir }}/{{ run_id }}/trivy-summary-{{ item }}.json
+      loop: "{{ lane_names }}"
       ignore_errors: yes
       become: no
 
-    # ── 5. PERFORMANCE BENCHMARKS ────────────────────────────────────────────
-
-    - name: k6 stress test per lane
-      shell: >
-        k6 run
-        -e PORT={{ lane_ports[item] }}
-        --summary-export={{ workspace }}/perf-{{ item }}.json
-        {{ workspace }}/stress-test.js
-      loop: "{{ lanes }}"
-      become: no
-
-    - name: Collect cold-start latency
+    - name: Syscall surface analysis — profile inference under strace
       shell: |
-        docker-compose stop {{ item }}
-        START=$(date +%s%N)
-        docker-compose start {{ item }}
-        curl -s --retry 10 --retry-delay 1 \
-          http://localhost:{{ lane_ports[item] }}/health > /dev/null
-        END=$(date +%s%N)
-        echo "{\"lane\":\"{{ item }}\",\"cold_start_ms\":$(( (END - START) / 1000000 ))}" \
-          > {{ workspace }}/coldstart-{{ item }}.json
+        set -e
+        LANE="{{ item.name }}"
+        PORT="{{ item.port }}"
+        CID=$(docker ps -qf "name={{ item.container }}")
+
+        # Attach strace to the running container process for 10 seconds
+        # while sending inference requests, then count unique syscalls
+        docker exec "$CID" sh -c \
+          'cat /proc/1/status | grep -E "^(Name|Pid|Threads):"' \
+          > {{ results_dir }}/{{ run_id }}/proc-info-${LANE}.txt 2>/dev/null || true
+
+        # Run strace via nsenter into the container's PID namespace
+        PID=$(docker inspect --format '{{"{{"}}.State.Pid{{"}}"}}' "$CID")
+
+        # Warm the inference endpoint first
+        for i in $(seq 5); do
+          curl -s -X POST http://localhost:${PORT}/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"features":[6,148,72,35,169,33.6,0.627,50]}' > /dev/null
+        done
+
+        # Collect syscall trace for 8 seconds under load
+        timeout 8 nsenter -t $PID -m -u -i -n -p -- \
+          strace -p 1 -f -e trace=all -o \
+          {{ results_dir }}/{{ run_id }}/strace-${LANE}.txt 2>/dev/null &
+        STRACE_PID=$!
+
+        # Drive inference requests during trace window
+        for i in $(seq 20); do
+          curl -s -X POST http://localhost:${PORT}/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"features":[6,148,72,35,169,33.6,0.627,50]}' > /dev/null
+        done
+
+        wait $STRACE_PID 2>/dev/null || true
+
+        # Extract unique syscall names and count
+        STRACE_FILE="{{ results_dir }}/{{ run_id }}/strace-${LANE}.txt"
+        if [ -f "$STRACE_FILE" ] && [ -s "$STRACE_FILE" ]; then
+          SYSCALLS=$(grep -oP '^[a-z_]+(?=\()' "$STRACE_FILE" | sort -u | wc -l)
+          SYSCALL_LIST=$(grep -oP '^[a-z_]+(?=\()' "$STRACE_FILE" | sort -u | tr '\n' ',' | sed 's/,$//')
+        else
+          # Fallback: use /proc seccomp info
+          SYSCALLS="N/A"
+          SYSCALL_LIST="strace_unavailable"
+        fi
+
+        echo "{\"lane\":\"${LANE}\",\"unique_syscalls\":\"${SYSCALLS}\",\"syscall_list\":\"${SYSCALL_LIST}\"}" \
+          > {{ results_dir }}/{{ run_id }}/syscall-{{ item.name }}.json
+
+        echo "Syscall surface for ${LANE}: ${SYSCALLS} unique syscalls"
+      loop: "{{ lanes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      ignore_errors: yes
+      register: syscall_results
+      become: yes
+
+    # ════════════════════════════════════════════════════════
+    # 4. PERFORMANCE — k6 AT THREE LOAD LEVELS
+    # ════════════════════════════════════════════════════════
+
+    - name: k6 stress test — {{ item[0].name }} lane @ {{ item[1] }} load
+      shell: |
+        k6 run \
+          -e PORT={{ item[0].port }} \
+          -e LANE={{ item[0].name }} \
+          -e LOAD_PROFILE={{ item[1] }} \
+          --summary-export={{ results_dir }}/{{ run_id }}/perf-{{ item[0].name }}-{{ item[1] }}.json \
+          {{ workspace }}/stress-test.js
       args:
         chdir: "{{ workspace }}"
-      loop: "{{ lanes }}"
+      loop: "{{ lanes | product(load_profiles) | list }}"
+      loop_control:
+        label: "{{ item[0].name }}-{{ item[1] }}"
+      ignore_errors: yes
       become: no
 
-    # ── 6. UNIFIED SUMMARY ────────────────────────────────────────────────────
-    #
-    # Merges trivy, sbom component count, image size, perf, and cold-start
-    # for each lane into a single ranked comparison table.
+    # ════════════════════════════════════════════════════════
+    # 5. COLD-START LATENCY (5 trials per lane)
+    # ════════════════════════════════════════════════════════
 
-    - name: Generate unified benchmark summary
+    - name: Cold-start trials for {{ item[0].name }} — trial {{ item[1] }}
       shell: |
-        python3 << 'EOF'
-        import json, glob, os
+        LANE="{{ item[0].name }}"
+        PORT="{{ item[0].port }}"
+        TRIAL="{{ item[1] }}"
 
-        lanes   = ['python', 'rust', 'wasm']
-        ws      = "{{ workspace }}"
+        docker-compose stop  {{ item[0].container }} > /dev/null 2>&1
+        sleep 2
+
+        START_NS=$(date +%s%N)
+        docker-compose start {{ item[0].container }} > /dev/null 2>&1
+
+        # Poll until healthy
+        READY=0
+        for i in $(seq 1 30); do
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:${PORT}/health 2>/dev/null || echo "000")
+          if [ "$CODE" = "200" ]; then READY=1; break; fi
+          sleep 0.5
+        done
+
+        END_NS=$(date +%s%N)
+        COLD_MS=$(( (END_NS - START_NS) / 1000000 ))
+
+        echo "{\"lane\":\"$LANE\",\"trial\":$TRIAL,\"cold_start_ms\":$COLD_MS,\"healthy\":$READY}" \
+          > {{ results_dir }}/{{ run_id }}/coldstart-${LANE}-${TRIAL}.json
+
+        echo "Cold-start ${LANE} trial ${TRIAL}: ${COLD_MS}ms (healthy=$READY)"
+      loop: "{{ lanes | product(range(1, coldstart_trials + 1)) | list }}"
+      loop_control:
+        label: "{{ item[0].name }}-trial-{{ item[1] }}"
+      args:
+        chdir: "{{ workspace }}"
+      become: no
+
+    # ════════════════════════════════════════════════════════
+    # 6. UNIFIED RUN SUMMARY
+    # ════════════════════════════════════════════════════════
+
+    - name: Aggregate and summarise all metrics for this run
+      shell: |
+        python3 << 'PYEOF'
+        import json, os, glob, statistics, math
+
+        WS     = "{{ workspace }}"
+        RD     = "{{ results_dir }}/{{ run_id }}"
+        LANES  = ["python", "rust", "wasm"]
+        PROFS  = ["low", "mid", "high"]
+
+        def load(path):
+            try:
+                with open(path) as f: return json.load(f)
+            except: return {}
+
         summary = {}
 
-        for lane in lanes:
-            entry = {"lane": lane}
+        for lane in LANES:
+            e = {"lane": lane}
 
-            # --- security: CVE counts per severity ---
-            tv = f"{ws}/trivy-{lane}.json"
-            if os.path.exists(tv):
-                with open(tv) as f:
-                    t = json.load(f)
-                entry["cve_summary"] = t.get("Summary", {})
-                entry["cve_total"]   = sum(entry["cve_summary"].values())
+            # ── Image size ───────────────────────────────────────────────────
+            im = load(f"{RD}/image-size-{lane}.json")
+            e["image_size_mb"] = round(im.get("image_size_bytes", 0) / 1e6, 1)
 
-            # --- compliance: SBOM component count ---
-            sb = f"{ws}/sbom-{lane}.json"
-            if os.path.exists(sb):
-                with open(sb) as f:
-                    s = json.load(f)
-                entry["sbom_components"] = len(s.get("components", []))
+            # ── CVE summary ──────────────────────────────────────────────────
+            tv = load(f"{RD}/trivy-summary-{lane}.json")
+            e["cve_summary"] = tv.get("Summary", {})
+            e["cve_total"]   = sum(e["cve_summary"].values())
+            e["cve_critical"]= e["cve_summary"].get("CRITICAL", 0)
+            e["cve_high"]    = e["cve_summary"].get("HIGH", 0)
+            e["cve_medium"]  = e["cve_summary"].get("MEDIUM", 0)
+            e["cve_list"]    = tv.get("CVE_list", [])[:10]  # top 10
 
-            # --- image size ---
-            im = f"{ws}/image-size-{lane}.json"
-            if os.path.exists(im):
-                with open(im) as f:
-                    entry["image_size_mb"] = round(
-                        json.load(f).get("size_bytes", 0) / 1e6, 1)
+            # ── SBOM ─────────────────────────────────────────────────────────
+            sb = load(f"{RD}/sbom-summary-{lane}.json")
+            e["sbom_components"]     = sb.get("total_components", "N/A")
+            e["sbom_by_type"]        = sb.get("by_type", {})
+            e["sbom_unique_licenses"]= sb.get("unique_licenses", "N/A")
 
-            # --- performance (k6 summary) ---
-            pf = f"{ws}/perf-{lane}.json"
-            if os.path.exists(pf):
-                with open(pf) as f:
-                    p = json.load(f)
-                metrics = p.get("metrics", {})
-                entry["p95_latency_ms"] = round(
-                    metrics.get("http_req_duration", {})
-                           .get("values", {})
-                           .get("p(95)", 0), 2)
-                entry["rps"] = round(
-                    metrics.get("http_reqs", {})
-                           .get("values", {})
-                           .get("rate", 0), 2)
+            # ── Syscall surface ──────────────────────────────────────────────
+            sc = load(f"{RD}/syscall-{lane}.json")
+            e["unique_syscalls"] = sc.get("unique_syscalls", "N/A")
 
-            # --- cold-start ---
-            cs = f"{ws}/coldstart-{lane}.json"
-            if os.path.exists(cs):
-                with open(cs) as f:
-                    entry["cold_start_ms"] = json.load(f).get("cold_start_ms")
+            # ── k6 performance (per load level) ──────────────────────────────
+            e["perf"] = {}
+            for prof in PROFS:
+                pf = load(f"{RD}/perf-{lane}-{prof}.json")
+                metrics = pf.get("metrics", {})
+                dur     = pf.get("root_group", {})
+                e["perf"][prof] = {
+                    "rps":             round(metrics.get("http_reqs",         {}).get("values",{}).get("rate",  0), 2),
+                    "p50_ms":          round(metrics.get("http_req_duration", {}).get("values",{}).get("med",   0), 2),
+                    "p95_ms":          round(metrics.get("http_req_duration", {}).get("values",{}).get("p(95)", 0), 2),
+                    "p99_ms":          round(metrics.get("http_req_duration", {}).get("values",{}).get("p(99)", 0), 2),
+                    "error_rate":      round(metrics.get("http_req_failed",   {}).get("values",{}).get("rate",  0), 4),
+                    "total_requests":  metrics.get("http_reqs", {}).get("values",{}).get("count", 0),
+                    "inference_p95_ms":round(metrics.get("inference_latency_ms",{}).get("values",{}).get("p(95)",0),2),
+                }
 
-            summary[lane] = entry
+            # ── Cold-start stats ──────────────────────────────────────────────
+            cold_vals = []
+            for trial in range(1, {{ coldstart_trials }} + 1):
+                cs = load(f"{RD}/coldstart-{lane}-{trial}.json")
+                v  = cs.get("cold_start_ms")
+                if v and cs.get("healthy", 0) == 1:
+                    cold_vals.append(v)
 
-        # --- rank each lane by composite score (lower CVEs + size + latency = better) ---
+            if cold_vals:
+                e["cold_start"] = {
+                    "trials":  len(cold_vals),
+                    "mean_ms": round(statistics.mean(cold_vals), 1),
+                    "median_ms":round(statistics.median(cold_vals), 1),
+                    "stdev_ms":round(statistics.stdev(cold_vals) if len(cold_vals) > 1 else 0, 1),
+                    "min_ms":  min(cold_vals),
+                    "max_ms":  max(cold_vals),
+                    "p99_ms":  sorted(cold_vals)[int(len(cold_vals)*0.99)] if cold_vals else 0,
+                    "raw":     cold_vals,
+                }
+            else:
+                e["cold_start"] = {"trials": 0, "mean_ms": "N/A"}
+
+            summary[lane] = e
+
+        # ── Composite ranking (lower = better) ────────────────────────────────
+        # Weight: critical CVEs=50, high CVEs=20, medium CVEs=5,
+        #         sbom_components=0.1, syscalls=0.5,
+        #         p95_mid=0.02, cold_start_mean=0.01, image_mb=0.05
         def score(e):
+            cs  = e.get("cold_start", {}).get("mean_ms", 9999)
+            cs  = cs if isinstance(cs, (int, float)) else 9999
+            p95 = e.get("perf", {}).get("mid", {}).get("p95_ms", 9999)
+            sysc= e.get("unique_syscalls", 999)
+            sysc= int(sysc) if str(sysc).isdigit() else 999
             return (
-                e.get("cve_total", 999) * 10 +
-                e.get("image_size_mb", 999) * 0.1 +
-                e.get("p95_latency_ms", 9999) * 0.01 +
-                e.get("cold_start_ms", 9999) * 0.001
+                e.get("cve_critical", 0) * 50 +
+                e.get("cve_high",     0) * 20 +
+                e.get("cve_medium",   0) * 5  +
+                e.get("sbom_components", 999) * 0.1 +
+                sysc                           * 0.5 +
+                p95                            * 0.02 +
+                cs                             * 0.01 +
+                e.get("image_size_mb", 999)    * 0.05
             )
 
         ranked = sorted(summary.values(), key=score)
-        for i, r in enumerate(ranked):
-            r["rank"] = i + 1
+        for i, r in enumerate(ranked): r["rank"] = i + 1
 
-        output = {
-            "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "winner": ranked[0]["lane"],
-            "lanes": ranked
+        run_output = {
+            "run_id":       "{{ run_id }}",
+            "generated_at": "{{ run_id }}",
+            "winner":       ranked[0]["lane"],
+            "lanes":        ranked
         }
 
-        out_path = f"{ws}/benchmark-summary.json"
-        with open(out_path, "w") as f:
-            json.dump(output, f, indent=2)
+        # Write per-run JSON
+        run_json = f"{RD}/run-summary.json"
+        with open(run_json, "w") as f:
+            json.dump(run_output, f, indent=2)
 
-        # Human-readable table to stdout (captured by Ansible)
-        print(f"\n{'='*60}")
-        print(f"  SPE BENCHMARK SUMMARY")
-        print(f"{'='*60}")
-        fmt = "{:<8}  {:>5}  {:>8}  {:>10}  {:>8}  {:>10}"
-        print(fmt.format("Lane","Rank","CVEs","Size(MB)","p95(ms)","ColdStart"))
-        print("-"*60)
+        # ── Append to rolling multi-run aggregate ────────────────────────────
+        agg_path = f"{{ results_dir }}/aggregate.json"
+        try:
+            with open(agg_path) as f: agg = json.load(f)
+        except: agg = {"runs": []}
+        agg["runs"].append(run_output)
+        agg["total_runs"] = len(agg["runs"])
+
+        # Compute cross-run stats for each lane × each metric
+        cross = {lane: {"p95_mid_samples":[],"cold_start_samples":[]} for lane in LANES}
+        for run in agg["runs"]:
+            for entry in run.get("lanes", []):
+                ln = entry["lane"]
+                p  = entry.get("perf",{}).get("mid",{}).get("p95_ms")
+                cs = entry.get("cold_start",{}).get("mean_ms")
+                if isinstance(p,  (int,float)): cross[ln]["p95_mid_samples"].append(p)
+                if isinstance(cs, (int,float)): cross[ln]["cold_start_samples"].append(cs)
+
+        for lane, vals in cross.items():
+            for key, samples in vals.items():
+                if len(samples) > 1:
+                    cross[lane][key.replace("_samples","_mean")] = round(statistics.mean(samples), 2)
+                    cross[lane][key.replace("_samples","_stdev")]= round(statistics.stdev(samples), 2)
+                    cross[lane][key.replace("_samples","_cv")]   = round(
+                        statistics.stdev(samples)/statistics.mean(samples)*100, 1) if statistics.mean(samples) else 0
+
+        agg["cross_run_stats"] = cross
+        with open(agg_path, "w") as f:
+            json.dump(agg, f, indent=2)
+
+        # ── Print human-readable summary ─────────────────────────────────────
+        W  = 62
+        LB = "─" * W
+        print(f"\n{'═'*W}")
+        print(f"  SPE BENCHMARK  ·  Run {run_output['run_id']}")
+        print(f"{'═'*W}")
+
+        print(f"\n{'── SECURITY ':─<{W}}")
+        hdr = f"{'Lane':<8}  {'Rank':>4}  {'CRIT':>5}  {'HIGH':>5}  {'MED':>5}  {'SBOM':>6}  {'Syscalls':>9}  {'Size(MB)':>9}"
+        print(hdr)
+        print(LB)
         for r in ranked:
-            print(fmt.format(
-                r["lane"], r["rank"],
-                r.get("cve_total","N/A"),
-                r.get("image_size_mb","N/A"),
-                r.get("p95_latency_ms","N/A"),
-                r.get("cold_start_ms","N/A")
-            ))
-        print(f"\n  WINNER: {ranked[0]['lane'].upper()}  (lowest composite risk score)")
-        print(f"{'='*60}\n")
-        EOF
+            sc_raw = r.get('unique_syscalls','N/A')
+            sbom   = r.get('sbom_components','N/A')
+            print(f"{r['lane']:<8}  {r['rank']:>4}  "
+                  f"{r.get('cve_critical',0):>5}  {r.get('cve_high',0):>5}  "
+                  f"{r.get('cve_medium',0):>5}  {str(sbom):>6}  "
+                  f"{str(sc_raw):>9}  {r.get('image_size_mb','N/A'):>9}")
+
+        print(f"\n{'── PERFORMANCE (p95 latency ms) ':─<{W}}")
+        hdr2 = f"{'Lane':<8}  {'Low':>8}  {'Mid':>8}  {'High':>8}  {'ColdStart':>11}  {'±':>7}"
+        print(hdr2)
+        print(LB)
+        for r in ranked:
+            p  = r.get("perf", {})
+            cs = r.get("cold_start", {})
+            print(f"{r['lane']:<8}  "
+                  f"{str(p.get('low',{}).get('p95_ms','N/A')):>8}  "
+                  f"{str(p.get('mid',{}).get('p95_ms','N/A')):>8}  "
+                  f"{str(p.get('high',{}).get('p95_ms','N/A')):>8}  "
+                  f"{str(cs.get('mean_ms','N/A')):>11}  "
+                  f"{str(cs.get('stdev_ms','N/A')):>7}")
+
+        print(f"\n{'── ERROR RATES (mid load) ':─<{W}}")
+        for r in ranked:
+            er = r.get("perf",{}).get("mid",{}).get("error_rate","N/A")
+            rps= r.get("perf",{}).get("mid",{}).get("rps","N/A")
+            print(f"  {r['lane']:<8}  err={er}  rps={rps}")
+
+        print(f"\n  WINNER (lowest composite risk+perf score): {ranked[0]['lane'].upper()}")
+        if agg["total_runs"] > 1:
+            print(f"  Total runs aggregated: {agg['total_runs']}  → see aggregate.json")
+        print(f"{'═'*W}\n")
+        PYEOF
       args:
         chdir: "{{ workspace }}"
       become: no
-      register: summary_output
+      register: bench_summary
 
     - name: Print benchmark summary
       debug:
-        msg: "{{ summary_output.stdout_lines }}"
+        msg: "{{ bench_summary.stdout_lines }}"
 
-    # ── 7. TEARDOWN ───────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # 7. TEARDOWN
+    # ════════════════════════════════════════════════════════
 
     - name: Stop and remove all lane containers
       shell: docker-compose down
       args:
         chdir: "{{ workspace }}"
       become: no
+
+    - name: Report output locations
+      debug:
+        msg:
+          - "Run results   → {{ results_dir }}/{{ run_id }}/run-summary.json"
+          - "All-runs agg  → {{ results_dir }}/aggregate.json"
+          - "Trivy scans   → {{ results_dir }}/{{ run_id }}/trivy-summary-{python,rust,wasm}.json"
+          - "SBOM reports  → {{ results_dir }}/{{ run_id }}/sbom-{python,rust,wasm}.json"
+          - "Syscall trace → {{ results_dir }}/{{ run_id }}/strace-{python,rust,wasm}.txt"

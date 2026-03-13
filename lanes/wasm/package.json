@@ -1,0 +1,9 @@
+{
+    "name": "spe-wasm-lane",
+    "version": "1.0.0",
+    "description": "WASM-sandboxed inference lane",
+    "main": "server.js",
+    "dependencies": {
+      "onnxruntime-node": "1.17.3"
+    }
+  }
