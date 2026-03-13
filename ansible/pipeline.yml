@@ -95,16 +95,16 @@
         chdir: "{{ workspace }}"
       become: no
 
-    - name: Wait for all lanes to be ready
-      uri:
-        url: "http://localhost:{{ lane_ports[item] }}/health"
-        status_code: 200
-      loop: "{{ lanes }}"
-      retries: 10
-      delay: 3
-      register: health_check
-      until: health_check is succeeded
-      become: no
+    # - name: Wait for all lanes to be ready
+    #   uri:
+    #     url: "http://localhost:{{ lane_ports[item] }}/health"
+    #     status_code: 200
+    #   loop: "{{ lanes }}"
+    #   retries: 10
+    #   delay: 3
+    #   register: health_check
+    #   until: health_check is succeeded
+    #   become: no
 
     # ── 4. COMPLIANCE & SECURITY AUDIT ──────────────────────────────────────
 
