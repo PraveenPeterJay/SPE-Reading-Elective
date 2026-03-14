@@ -351,7 +351,7 @@
       loop_control:
         label: "{{ item[0].name }}-vu{{ item[1] }}"
       become: no
-      
+
   # ---------------------------------------------------------------------------
   # SECTION 8 — Accuracy (batch inference over test set)
   # ---------------------------------------------------------------------------
@@ -360,11 +360,13 @@
       shell: |
         result=$(curl -s -X POST http://localhost:{{ item.port }}/batch \
           -H "Content-Type: application/json" \
-          --data-binary @{{ batch_payload_file }})
+          --data-binary @model_artifacts/{{ batch_payload_file }})
         acc=$(echo "$result" | jq '.accuracy // "N/A"')
         echo "{{ item.name }}: accuracy=${acc}" \
           >> {{ workspace }}/accuracy-summary.txt
       loop: "{{ lanes }}"
+      args:
+        chdir: "{{ workspace }}"
       become: no
       ignore_errors: yes
 
