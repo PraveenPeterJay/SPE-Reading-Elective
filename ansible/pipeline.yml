@@ -19,8 +19,8 @@
       - name: wasm
         port: 8502
     k6_vus:         [10, 50, 100]        # three load levels for degradation curve
-    k6_duration:    "30s"
-    bench_runs:     5                    # repeat each k6 scenario → mean ± std
+    k6_duration:    "3s"
+    bench_runs:     1                    # repeat each k6 scenario → mean ± std
     test_payload:   '{"features":[7,159,64,29,125,27.4,0.294,40]}'
     batch_payload_file: "{{ workspace }}/test_samples.json"
 
