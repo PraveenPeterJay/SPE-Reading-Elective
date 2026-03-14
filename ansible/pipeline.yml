@@ -276,6 +276,10 @@
 
     - name: "12. Measure cold-start latency (stop → start → first request)"
       shell: |
+        {% if item.name == lanes[0].name %}
+        > {{ workspace }}/coldstart-summary.txt
+        {% endif %}
+
         container=$(docker ps --filter "publish={{ item.port }}" -q)
         docker stop "$container" > /dev/null
 
@@ -356,7 +360,17 @@
   # SECTION 8 — Accuracy (batch inference over test set)
   # ---------------------------------------------------------------------------
 
-    - name: "15. Batch accuracy check"
+    - name: "15a. Wait for services to be ready"
+      wait_for:
+        port: "{{ item.port }}"
+        host: localhost
+        timeout: 30
+        state: started
+      loop: "{{ lanes }}"
+      loop_control:
+        label: "{{ item.name }} (port {{ item.port }})"
+
+    - name: "15b. Batch accuracy check"
       shell: |
         {% if item.name == lanes[0].name %}
         > {{ workspace }}/accuracy-summary.txt
