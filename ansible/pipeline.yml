@@ -22,7 +22,7 @@
     k6_duration:    "3s"
     bench_runs:     1                    # repeat each k6 scenario → mean ± std
     test_payload:   '{"features":[7,159,64,29,125,27.4,0.294,40]}'
-    batch_payload_file: "{{ workspace }}/test_samples.json"
+    batch_payload_file: "test_samples.json"
 
   # ---------------------------------------------------------------------------
   # SECTION 0 — Bootstrap / idempotency guards
@@ -360,17 +360,7 @@
   # SECTION 8 — Accuracy (batch inference over test set)
   # ---------------------------------------------------------------------------
 
-    - name: "15a. Wait for services to be ready"
-      wait_for:
-        port: "{{ item.port }}"
-        host: localhost
-        timeout: 30
-        state: started
-      loop: "{{ lanes }}"
-      loop_control:
-        label: "{{ item.name }} (port {{ item.port }})"
-
-    - name: "15b. Batch accuracy check"
+    - name: "15a. Batch accuracy check"
       shell: |
         {% if item.name == lanes[0].name %}
         > {{ workspace }}/accuracy-summary.txt
