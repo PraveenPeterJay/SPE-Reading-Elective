@@ -358,17 +358,24 @@
 
     - name: "15. Batch accuracy check"
       shell: |
+        # 1. Clear file only if it's the first lane (e.g., python)
+        {% if item.name == lanes[0].name %}
+        > {{ workspace }}/accuracy-summary.txt
+        {% endif %}
+
+        # 2. Run the check
         result=$(curl -s -X POST http://localhost:{{ item.port }}/batch \
           -H "Content-Type: application/json" \
           --data-binary @model_artifacts/{{ batch_payload_file }})
-        acc=$(echo "$result" | jq '.accuracy // "N/A"')
-        echo "{{ item.name }}: accuracy=${acc}" \
-          >> {{ workspace }}/accuracy-summary.txt
+        
+        # 3. Use -r for raw output and check multiple possible keys
+        acc=$(echo "$result" | jq -r '.accuracy // .acc // "N/A"')
+        
+        echo "{{ item.name }}: accuracy=${acc}" >> {{ workspace }}/accuracy-summary.txt
       loop: "{{ lanes }}"
       args:
         chdir: "{{ workspace }}"
       become: no
-      ignore_errors: yes
 
   # ---------------------------------------------------------------------------
   # SECTION 9 — Docker image size
@@ -376,10 +383,19 @@
 
     - name: "16. Record Docker image sizes"
       shell: |
-        # Use raw tags to protect the Docker .Size variable from Jinja2
+        # 1. Clear the file only on the first iteration (Python)
+        {% if item.name == lanes[0].name %}
+        > {{ workspace }}/imagesize-summary.txt
+        {% endif %}
+
+        # 2. Get raw size in bytes
         size=$(docker image inspect secure-{{ item.name }}:latest \
               --format '{% raw %}{{.Size}}{% endraw %}')
+        
+        # 3. Convert to MB (using bc for 2-decimal precision)
         size_mb=$(echo "scale=2; $size/1048576" | bc)
+        
+        # 4. Record the isolated build result
         echo "{{ item.name }}: ${size_mb} MB" >> {{ workspace }}/imagesize-summary.txt
       loop: "{{ lanes }}"
       become: no
