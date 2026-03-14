@@ -25,8 +25,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # 5. Copy model artifacts (scaler + ONNX model)
 #    Keeping them on a separate layer means code changes don't invalidate
 #    the (larger) model layer cache.
-COPY model_artifacts/model.onnx    /app/model_artifacts/model.onnx
-COPY model_artifacts/scaler.json   /app/model_artifacts/scaler.json
+COPY model_artifacts/    /app/model_artifacts/
 
 # 6. Copy application code
 COPY python-app/main.py .

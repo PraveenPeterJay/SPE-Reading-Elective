@@ -11,55 +11,64 @@ import resource
 # ─────────────────────────────────────────────
 # 1. App Initialisation
 # ─────────────────────────────────────────────
-app = FastAPI(title="Generic Inference Lane – Python/ONNX")
+app = FastAPI(title="Generic ONNX Inference – Python")
 
 # ─────────────────────────────────────────────
-# 2. Load Model & Scaler (Generic Detection)
+# 2. Load Artifacts (Generic Logic)
 # ─────────────────────────────────────────────
-MODEL_PATH  = os.getenv("MODEL_PATH",  "/app/model_artifacts/model.onnx")
-SCALER_PATH = os.getenv("SCALER_PATH", "/app/model_artifacts/scaler.json")
+MODEL_PATH   = os.getenv("MODEL_PATH",   "/app/model_artifacts/model.onnx")
+SCALER_PATH  = os.getenv("SCALER_PATH",  "/app/model_artifacts/scaler.json")
+CLASSES_PATH = os.getenv("CLASSES_PATH", "/app/model_artifacts/classes.json")
 
-print(f"Loading ONNX model from {MODEL_PATH}...")
+print(f"Loading ONNX model from {MODEL_PATH} ...")
 ort_session = ort.InferenceSession(MODEL_PATH)
+INPUT_NAME  = ort_session.get_inputs()[0].name
 
-# DYNAMIC METADATA EXTRACTION
-input_meta     = ort_session.get_inputs()[0]
-INPUT_NAME     = input_meta.name
-INPUT_SHAPE    = input_meta.shape  # e.g., [Batch, Features]
-EXPECTED_COUNT = INPUT_SHAPE[1]
-
-print(f"Model loaded  | Input: {INPUT_NAME} | Expected Features: {EXPECTED_COUNT}")
-
-print(f"Loading scaler from {SCALER_PATH}...")
+print(f"Loading scaler from {SCALER_PATH} ...")
 with open(SCALER_PATH) as f:
-    scaler = json.load(f)
+    scaler_data = json.load(f)
+SCALER_MEAN = np.array(scaler_data["mean"],  dtype=np.float32)
+SCALER_STD  = np.array(scaler_data["scale"], dtype=np.float32)
+N_FEATURES  = len(SCALER_MEAN)
 
-# Safe Key Loading: Handles 'mean' vs 'mean_' and 'scale' vs 'std'
-SCALER_MEAN = np.array(scaler.get("mean", scaler.get("mean_")), dtype=np.float32)
-SCALER_STD  = np.array(scaler.get("scale", scaler.get("std", scaler.get("scale_"))), dtype=np.float32)
+print(f"Loading classes from {CLASSES_PATH} (optional) ...")
+CLASS_MAP = {}
+if os.path.exists(CLASSES_PATH):
+    with open(CLASSES_PATH) as f:
+        raw_classes = json.load(f)
+        # FIX: Ensure keys are integers for matching model output
+        CLASS_MAP = {int(k): v for k, v in raw_classes.items()}
+else:
+    print("No classes.json found, using default indices.")
 
-if len(SCALER_MEAN) != EXPECTED_COUNT:
-    print(f"WARNING: Scaler size ({len(SCALER_MEAN)}) mismatch with Model features ({EXPECTED_COUNT})")
-
-print("Scaler loaded successfully.")
+print(f"Startup complete. Features expected: {N_FEATURES}")
 
 # ─────────────────────────────────────────────
-# 3. Generic Pre-processor
+# 3. Helper Logic
 # ─────────────────────────────────────────────
 def preprocess(features: list[float]) -> np.ndarray:
-    """
-    Validates and scales input features based on the detected model shape.
-    """
-    if len(features) != EXPECTED_COUNT:
-        raise ValueError(f"Model expects {EXPECTED_COUNT} features, but received {len(features)}")
+    if len(features) != N_FEATURES:
+        raise ValueError(f"Dimension mismatch: expected {N_FEATURES}, got {len(features)}")
     
-    # Convert to numpy and scale
     arr = np.array(features, dtype=np.float32).reshape(1, -1)
     arr = (arr - SCALER_MEAN) / SCALER_STD
-    return arr.astype(np.float32)
+    return arr
+
+def extract_label_and_conf(outputs):
+    # outputs[0] is the "logit" [batch, 1]
+    logit = float(outputs[0][0])
+    
+    # 1. Prediction: Threshold at 0.0 for Logits
+    predicted_label = 1 if logit > 0 else 0
+    
+    # 2. Confidence: Sigmoid function to convert Logit -> Probability
+    # formula: 1 / (1 + exp(-x))
+    confidence = 1.0 / (1.0 + np.exp(-logit))
+    
+    return predicted_label, float(confidence)
 
 # ─────────────────────────────────────────────
-# 4. /predict – single-sample inference
+# 4. API Endpoints
 # ─────────────────────────────────────────────
 @app.post("/predict")
 async def predict(request: Request):
@@ -71,44 +80,24 @@ async def predict(request: Request):
     try:
         t0 = time.perf_counter()
         input_tensor = preprocess(features)
+        outputs      = ort_session.run(None, {INPUT_NAME: input_tensor})
+        latency_ms   = (time.perf_counter() - t0) * 1000
+
+        pred, conf = extract_label_and_conf(outputs)
         
-        # Run Inference
-        outputs = ort_session.run(None, {INPUT_NAME: input_tensor})
-        latency_ms = (time.perf_counter() - t0) * 1000
-
-        # Extract Prediction (Generic flattening)
-        predicted_label = int(np.array(outputs[0]).flatten()[0])
-
-        # Confidence Handling (Generic)
-        confidence = 1.0
-        if len(outputs) > 1:
-            prob_raw = outputs[1]
-            if isinstance(prob_raw, list) and len(prob_raw) > 0:
-                # Handle sklearn-onnx list of dicts
-                d = prob_raw[0]
-                confidence = float(d.get(predicted_label, d.get(str(predicted_label), 0.5)))
-            else:
-                # Handle raw probability arrays
-                prob_arr = np.array(prob_raw).flatten()
-                if len(prob_arr) > predicted_label:
-                    confidence = float(prob_arr[predicted_label])
-
         return {
-            "prediction":  predicted_label,
-            "confidence":  round(confidence, 6),
+            "prediction":  pred,
+            "label_text":  CLASS_MAP.get(pred, f"Class {pred}"),
+            "confidence":  round(conf, 6),
             "latency_ms":  round(latency_ms, 4),
-            "runtime":     "python-onnx",
-            "features_processed": EXPECTED_COUNT
+            "runtime":     "python-onnx-generic",
         }
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(e)}, status_code=400)
 
-# ─────────────────────────────────────────────
-# 5. /batch – bulk inference
-# ─────────────────────────────────────────────
 @app.post("/batch")
 async def batch_predict(request: Request):
-    body = await request.json()
+    body    = await request.json()
     samples = body.get("samples", [])
     if not samples:
         return JSONResponse({"error": "Empty 'samples' list"}, status_code=422)
@@ -117,59 +106,43 @@ async def batch_predict(request: Request):
 
     for s in samples:
         try:
-            features   = s["features"]
-            true_label = s.get("label")
-
-            t0   = time.perf_counter()
-            inp  = preprocess(features)
+            t0 = time.perf_counter()
+            inp = preprocess(s["features"])
             outs = ort_session.run(None, {INPUT_NAME: inp})
-            ms   = (time.perf_counter() - t0) * 1000
-
-            pred = int(np.array(outs[0]).flatten()[0])
-            latencies.append(ms)
+            lat = (time.perf_counter() - t0) * 1000
             
-            if true_label is not None and pred == true_label:
+            pred, conf = extract_label_and_conf(outs)
+            true_label = s.get("label")
+            
+            latencies.append(lat)
+            if true_label is not None and pred == int(true_label):
                 correct += 1
 
             results.append({
                 "prediction": pred,
-                "latency_ms": round(ms, 4),
-                "true_label": true_label
+                "confidence": round(conf, 6),
+                "latency_ms": round(lat, 4),
+                "true_label": true_label,
             })
-        except Exception:
-            continue
+        except Exception as e:
+            return JSONResponse({"error": f"Sample error: {str(e)}"}, status_code=400)
 
+    accuracy = correct / len(samples) if samples else None
     return {
-        "n_samples":       len(samples),
-        "mean_latency_ms": round(float(np.mean(latencies)), 4) if latencies else 0,
-        "runtime":         "python-onnx",
-        "results":         results
+        "results":          results,
+        "n_samples":        len(samples),
+        "accuracy":         round(accuracy, 4) if accuracy is not None else None,
+        "mean_latency_ms":  round(float(np.mean(latencies)), 4),
+        "p99_latency_ms":   round(float(np.percentile(latencies, 99)), 4),
+        "runtime":          "python-onnx-generic",
     }
 
-# ─────────────────────────────────────────────
-# 6. /health – resource snapshot
-# ─────────────────────────────────────────────
 @app.get("/health")
 async def health():
     proc = psutil.Process()
     return {
         "status":        "ok",
-        "runtime":       "python-onnx",
+        "n_features":    N_FEATURES,
         "rss_mb":        round(proc.memory_info().rss / 1024 / 1024, 2),
-        "expected_features": EXPECTED_COUNT,
-        "model_inputs":  [i.name for i in ort_session.get_inputs()]
+        "class_mapping": CLASS_MAP
     }
-
-# ─────────────────────────────────────────────
-# 7. Metrics
-# ─────────────────────────────────────────────
-_counters = {"requests": 0, "errors": 0}
-
-@app.middleware("http")
-async def count_requests(request: Request, call_next):
-    _counters["requests"] += 1
-    return await call_next(request)
-
-@app.get("/metrics")
-async def metrics():
-    return _counters

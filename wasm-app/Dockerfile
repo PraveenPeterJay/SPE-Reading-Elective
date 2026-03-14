@@ -28,8 +28,7 @@ RUN spin build || true
 COPY wasm-app/src ./src
 COPY wasm-app/spin.toml .
 # Copy model artifacts so spin.toml file-mount resolution works at build time
-COPY model_artifacts/model.onnx   ./model_artifacts/model.onnx
-COPY model_artifacts/scaler.json  ./model_artifacts/scaler.json
+COPY model_artifacts/   ./model_artifacts/
 RUN touch src/lib.rs
 RUN RUSTFLAGS="-C target-feature=+simd128" spin build
 
@@ -49,8 +48,7 @@ COPY --from=builder /usr/src/app/target/wasm32-wasip1/release/wasm_app.wasm ./wa
 # Spin resolves "source" paths relative to where spin.toml lives at runtime.
 # We keep the same relative layout as in the builder.
 COPY --from=builder /usr/src/app/spin.toml            ./spin.toml
-COPY --from=builder /usr/src/app/model_artifacts/model.onnx   ./model_artifacts/model.onnx
-COPY --from=builder /usr/src/app/model_artifacts/scaler.json  ./model_artifacts/scaler.json
+COPY --from=builder /usr/src/app/model_artifacts/   ./model_artifacts/
 
 EXPOSE 8000
 

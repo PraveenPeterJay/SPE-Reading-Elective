@@ -47,8 +47,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 RUN useradd --no-create-home --shell /bin/false appuser
 
-COPY model_artifacts/model.onnx   /app/model_artifacts/model.onnx
-COPY model_artifacts/scaler.json  /app/model_artifacts/scaler.json
+COPY model_artifacts/   /app/model_artifacts/
 
 COPY --from=builder /usr/src/app/target/release/rust-app /app/rust-app
 RUN chmod +x /app/rust-app

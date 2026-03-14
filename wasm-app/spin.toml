@@ -10,11 +10,11 @@ component = "wasm-app"
 
 [component.wasm-app]
 source = "wasm_app.wasm"
-# Mount both model artifacts into the WASI sandbox filesystem root
-# lib.rs reads them as "model.onnx" and "scaler.json" (no path prefix)
+# Mount model artifacts into the WASI sandbox filesystem root
 files = [
     { source = "model_artifacts/model.onnx",  destination = "model.onnx"  },
     { source = "model_artifacts/scaler.json", destination = "scaler.json" },
+    { source = "model_artifacts/classes.json", destination = "classes.json" },
 ]
 
 [component.wasm-app.build]
