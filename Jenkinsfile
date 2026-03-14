@@ -11,7 +11,7 @@ pipeline {
         stage('Run Ansible Pipeline') {
             steps {
                 sh '''
-                    ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml -vvv
+                    ansible-playbook -i ansible/inventory.ini ansible/pipeline.yml #-vvv
                 '''
             }
         }

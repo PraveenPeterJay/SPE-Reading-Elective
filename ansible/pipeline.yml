@@ -360,11 +360,11 @@
 
     - name: "16. Record Docker image sizes"
       shell: |
+        # Use raw tags to protect the Docker .Size variable from Jinja2
         size=$(docker image inspect secure-{{ item.name }}:latest \
-               --format '{{{{.Size}}}}')
+              --format '{% raw %}{{.Size}}{% endraw %}')
         size_mb=$(echo "scale=2; $size/1048576" | bc)
-        echo "{{ item.name }}: ${size_mb} MB" \
-          >> {{ workspace }}/imagesize-summary.txt
+        echo "{{ item.name }}: ${size_mb} MB" >> {{ workspace }}/imagesize-summary.txt
       loop: "{{ lanes }}"
       become: no
 
