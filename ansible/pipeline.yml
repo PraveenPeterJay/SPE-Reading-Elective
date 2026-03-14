@@ -228,38 +228,40 @@
   # ---------------------------------------------------------------------------
 
     - name: "11. Capture memory footprint (RSS) via docker stats"
-      shell: |
-        # 1. Warm-up inference
-        # Note: Using 'test_payload | to_json' directly for clean JSON formatting
-        curl -s -X POST http://localhost:{{ item.port }}/predict \
-          -H "Content-Type: application/json" \
-          -d '{{ test_payload | to_json }}' > /dev/null
+      shell: 
+        cmd: |
+          # 1. Warm-up inference
+          PAYLOAD='{{ test_payload | to_json }}'
+          curl -s -X POST http://localhost:{{ item.port }}/predict \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" > /dev/null
 
-        # 2. Collect Stats (Median of 3)
-        readings=()
-        for i in {1..3}; do
-          # Get memory usage and strip units
-          mb=$(docker stats --no-stream --format "{% raw %}{{.MemUsage}}{% endraw %}" \
-                $(docker ps --filter "publish={{ item.port }}" -q) \
-              | awk -F'/' '{print $1}' \
-              | sed 's/[^0-9.]//g')
-          
-          # Only add to array if mb is not empty (prevents sort errors)
-          [[ -n "$mb" ]] && readings+=("$mb")
-          sleep 2
-        done
+          # 2. Collect Stats (Median of 3)
+          readings=()
+          for i in {1..3}; do
+            # Use raw tags to protect the Go template from Jinja
+            mb=$(docker stats --no-stream --format "{% raw %}{{.MemUsage}}{% endraw %}" \
+                  $(docker ps --filter "publish={{ item.port }}" -q) \
+                | awk -F'/' '{print $1}' \
+                | sed 's/[^0-9.]//g')
+            
+            if [ -n "$mb" ]; then
+                readings+=("$mb")
+            fi
+            sleep 2
+          done
 
-        # 3. Output median
-        if [ ${#readings[@]} -eq 3 ]; then
-          median=$(printf '%s\n' "${readings[@]}" | sort -n | sed -n '2p')
-          echo "{{ item.name }}: ${median} MiB RSS (warm)" >> {{ workspace }}/memory-summary.txt
-        else
-          echo "{{ item.name }}: Error collecting stats" >> {{ workspace }}/memory-summary.txt
-        fi
-      args:
-        executable: /bin/bash  # <--- CRITICAL FIX
+          # 3. Output median
+          if [ ${#readings[@]} -ge 1 ]; then
+            median=$(printf '%s\n' "${readings[@]}" | sort -n | sed -n '2p' || printf '%s\n' "${readings[@]}" | head -n 1)
+            echo "{{ item.name }}: ${median} MiB RSS (warm)" >> {{ workspace }}/memory-summary.txt
+          else
+            echo "{{ item.name }}: Error collecting stats" >> {{ workspace }}/memory-summary.txt
+          fi
+        executable: /bin/bash
       loop: "{{ lanes }}"
       become: no
+      
   # ---------------------------------------------------------------------------
   # SECTION 6 — Cold-start latency
   # ---------------------------------------------------------------------------
