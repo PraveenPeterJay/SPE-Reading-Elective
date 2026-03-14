@@ -228,9 +228,10 @@
   # ---------------------------------------------------------------------------
 
     - name: "11. Capture memory footprint (RSS) via docker stats"
-      shell: 
+      shell:
         cmd: |
           # 1. Warm-up inference
+          # We use a shell variable to avoid quote nesting issues
           PAYLOAD='{{ test_payload | to_json }}'
           curl -s -X POST http://localhost:{{ item.port }}/predict \
             -H "Content-Type: application/json" \
@@ -239,7 +240,7 @@
           # 2. Collect Stats (Median of 3)
           readings=()
           for i in {1..3}; do
-            # Use raw tags to protect the Go template from Jinja
+            # Using raw tags for BOTH the Go template AND the Bash array length later
             mb=$(docker stats --no-stream --format "{% raw %}{{.MemUsage}}{% endraw %}" \
                   $(docker ps --filter "publish={{ item.port }}" -q) \
                 | awk -F'/' '{print $1}' \
@@ -252,16 +253,23 @@
           done
 
           # 3. Output median
-          if [ ${#readings[@]} -ge 1 ]; then
+          # FIX: Wrap the array length check in raw tags to prevent "Missing end of comment" error
+          {% raw %}
+          if [ ${#readings[@]} -gt 0 ]; then
             median=$(printf '%s\n' "${readings[@]}" | sort -n | sed -n '2p' || printf '%s\n' "${readings[@]}" | head -n 1)
+            {% endraw %}
             echo "{{ item.name }}: ${median} MiB RSS (warm)" >> {{ workspace }}/memory-summary.txt
+          {% raw %}
           else
+            {% endraw %}
             echo "{{ item.name }}: Error collecting stats" >> {{ workspace }}/memory-summary.txt
+          {% raw %}
           fi
+          {% endraw %}
         executable: /bin/bash
       loop: "{{ lanes }}"
       become: no
-      
+
   # ---------------------------------------------------------------------------
   # SECTION 6 — Cold-start latency
   # ---------------------------------------------------------------------------
