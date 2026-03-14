@@ -25,6 +25,19 @@ struct AppState {
 #[derive(Deserialize)]
 struct PredictRequest { features: Vec<f32> }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum BatchInput {
+    Wrapped { samples: Vec<Sample> },
+    Direct(Vec<Sample>),
+}
+
+#[derive(Deserialize)]
+pub struct Sample {
+    pub features: Vec<f32>,
+    pub label: Option<i64>,
+}
+
 #[derive(Serialize)]
 struct PredictResponse {
     prediction:  i64,
@@ -34,6 +47,23 @@ struct PredictResponse {
     runtime:     String,
 }
 
+#[derive(Serialize)]
+pub struct BatchResponse {
+    pub results: Vec<SampleResult>,
+    pub n_samples: usize,
+    pub accuracy: Option<f64>,
+    pub mean_latency_ms: f64,
+    pub p99_latency_ms: f64,
+    pub runtime: String,
+}
+
+#[derive(Serialize)]
+pub struct SampleResult {
+    pub prediction: i64,
+    pub confidence: f64,
+    pub latency_ms: f64,
+    pub true_label: Option<i64>,
+}
 // ─────────────────────────────────────────────
 // 3. Core Inference Logic (The Type-Agnostic Version)
 // ─────────────────────────────────────────────
@@ -95,6 +125,63 @@ async fn predict(body: web::Json<PredictRequest>, data: web::Data<AppState>) -> 
     }
 }
 
+#[post("/batch")]
+async fn batch(body: web::Bytes, data: web::Data<AppState>) -> impl Responder {
+    // 1. Parse the flexible input (Handles direct list or wrapped)
+    let input: BatchInput = match serde_json::from_slice(&body) {
+        Ok(val) => val,
+        Err(e) => return HttpResponse::BadRequest().json(json!({"error": format!("Invalid JSON: {}", e)})),
+    };
+
+    let samples = match input {
+        BatchInput::Wrapped { samples } => samples,
+        BatchInput::Direct(samples) => samples,
+    };
+
+    let mut results = Vec::new();
+    let mut latencies = Vec::new();
+    let mut correct = 0;
+
+    // 2. Process batch through your existing infer() function
+    for s in &samples {
+        match infer(&data, &s.features) {
+            Ok((pred, _text, conf, lat)) => {
+                latencies.push(lat);
+                if let Some(lbl) = s.label {
+                    if pred == lbl { correct += 1; }
+                }
+                results.push(SampleResult {
+                    prediction: pred,
+                    confidence: (conf as f64 * 1e4).round() / 1e4,
+                    latency_ms: (lat * 1e4).round() / 1e4,
+                    true_label: s.label,
+                });
+            }
+            Err(e) => return HttpResponse::InternalServerError().json(json!({"error": e})),
+        }
+    }
+
+    // 3. Calculate Stats
+    let n = latencies.len() as f64;
+    let mean_lat = if n > 0.0 { latencies.iter().sum::<f64>() / n } else { 0.0 };
+    
+    let mut sorted = latencies.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p99 = if !sorted.is_empty() {
+        sorted[((n * 0.99) as usize).min(sorted.len() - 1)]
+    } else { 0.0 };
+
+    // 4. Return formatted response
+    HttpResponse::Ok().json(BatchResponse {
+        results,
+        n_samples: samples.len(),
+        accuracy: if n > 0.0 { Some((correct as f64 / n * 1e4).round() / 1e4) } else { None },
+        mean_latency_ms: (mean_lat * 1e4).round() / 1e4,
+        p99_latency_ms: (p99 * 1e4).round() / 1e4,
+        runtime: "rust-ort-generic".into(),
+    })
+}
+
 #[get("/health")]
 async fn health() -> impl Responder {
     HttpResponse::Ok().json(json!({ "status": "ok", "runtime": "rust-ort-generic" }))
@@ -139,7 +226,7 @@ async fn main() -> std::io::Result<()> {
 
     println!("Server running on 0.0.0.0:8000 (Features: {})", state.scaler_mean.len());
     HttpServer::new(move || {
-        App::new().app_data(state.clone()).service(predict).service(health)
+        App::new().app_data(state.clone()).service(predict).service(batch).service(health)
     })
     .bind(("0.0.0.0", 8000))?
     .run()

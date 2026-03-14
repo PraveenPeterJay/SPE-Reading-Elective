@@ -97,10 +97,17 @@ async def predict(request: Request):
 
 @app.post("/batch")
 async def batch_predict(request: Request):
-    body    = await request.json()
-    samples = body.get("samples", [])
+    # Load the raw body
+    body = await request.json()
+    if isinstance(body, list):
+        samples = body
+    elif isinstance(body, dict):
+        samples = body.get("samples", [])
+    else:
+        return JSONResponse({"error": "Invalid format. Provide a list of samples."}, status_code=422)
+
     if not samples:
-        return JSONResponse({"error": "Empty 'samples' list"}, status_code=422)
+        return JSONResponse({"error": "Batch is empty"}, status_code=422)
 
     results, latencies, correct = [], [], 0
 

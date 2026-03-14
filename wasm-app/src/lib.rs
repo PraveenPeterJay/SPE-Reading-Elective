@@ -57,6 +57,14 @@ static MODEL: Lazy<OnnxPlan> = Lazy::new(|| {
 // ─────────────────────────────────────────────
 // 3. Request / Response types
 // ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(untagged)] // This is the magic: it tries to match the structure
+pub enum BatchInput {
+    Wrapped { samples: Vec<Sample> },
+    Direct(Vec<Sample>),
+}
+
 #[derive(Deserialize)]
 struct PredictRequest { features: Vec<f32> }
 
@@ -165,18 +173,41 @@ fn handle_predict(req: Request) -> anyhow::Result<Response> {
 }
 
 fn handle_batch(req: Request) -> anyhow::Result<Response> {
-    let body: BatchRequest = serde_json::from_slice(req.body())?;
+    // 1. Deserialize into the Enum
+    let input: BatchInput = serde_json::from_slice(req.body())?;
+    
+    // 2. Extract into a local vector
+    let samples = match input {
+        BatchInput::Wrapped { samples } => samples,
+        BatchInput::Direct(samples) => samples,
+    };
+
+    // Safety check: Don't process empty batches
+    // Safety check: Don't process empty batches
+    if samples.is_empty() {
+        return Ok(Response::builder()
+            .status(422)
+            .header("content-type", "application/json")
+            // Returning a JSON error is better for your t.sh script to parse
+            .body(r#"{"error": "Empty samples list"}"#)
+            .build());
+    }
+
     let mut results = Vec::new();
     let mut latencies = Vec::new();
     let mut correct = 0usize;
 
-    for s in &body.samples {
+    for s in &samples {
         let (pred, _text, conf, lat) = infer(&s.features)?;
         latencies.push(lat);
-        if let Some(lbl) = s.label { if pred == lbl { correct += 1; } }
+        
+        if let Some(lbl) = s.label { 
+            if pred == lbl as i64 { correct += 1; } 
+        }
+        
         results.push(SampleResult {
             prediction: pred,
-            confidence: (conf * 1e6).round() / 1e6,
+            confidence: (conf as f64 * 1e6).round() / 1e6,
             latency_ms: (lat  * 1e4).round() / 1e4,
             true_label: s.label,
         });
@@ -185,20 +216,25 @@ fn handle_batch(req: Request) -> anyhow::Result<Response> {
     let n = latencies.len() as f64;
     let mean_lat = latencies.iter().sum::<f64>() / n;
     let mut sorted = latencies.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     
+    // 3. Construct response using 'samples' and 'results' instead of 'body'
     let resp = BatchResponse {
-        results,
-        n_samples: body.samples.len(),
-        accuracy: if body.samples.iter().any(|s| s.label.is_some()) {
+        n_samples: samples.len(), // FIXED: replaced body.samples
+        accuracy: if samples.iter().any(|s| s.label.is_some()) { // FIXED: replaced body.samples
             Some((correct as f64 / n * 1e4).round() / 1e4)
         } else { None },
+        results,
         mean_latency_ms: (mean_lat * 1e4).round() / 1e4,
         p99_latency_ms: (sorted[((n * 0.99) as usize).min(sorted.len() - 1)] * 1e4).round() / 1e4,
         runtime: "wasm-spin-tract-generic".into(),
     };
 
-    Ok(Response::builder().status(200).header("content-type", "application/json").body(serde_json::to_string(&resp)?).build())
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&resp)?)
+        .build())
 }
 
 fn handle_health() -> anyhow::Result<Response> {
