@@ -319,20 +319,41 @@
       ignore_errors: yes
 
     - name: "14. Aggregate k6 results — mean ± std per lane per VU level"
-      shell: |
-        lane="{{ item[0].name }}"
-        vus="{{ item[1] }}"
-        files="{{ workspace }}/k6-${lane}-vu${vus}-run*.json"
+      shell:
+        cmd: |
+          lane="{{ item[0].name }}"
+          vus="{{ item[1] }}"
+          
+          # 1. Expand the wildcard into a real Bash array
+          files=({{ workspace }}/k6-${lane}-vu${vus}-run*.json)
 
-        # Extract p99 http_req_duration from each run
-        p99_values=$(jq -s '[.[].metrics.http_req_duration.values."p(99)"]' $files)
-        mean=$(echo "$p99_values" | jq 'add/length')
-        std=$(echo  "$p99_values" | jq 'sqrt(map(. - '"$mean"') | map(. * .) | add / length)')
-        min=$(echo  "$p99_values" | jq 'min')
-        max=$(echo  "$p99_values" | jq 'max')
+          # 2. Check if the first file actually exists
+          if [ ! -f "${files[0]}" ]; then
+            echo "Warning: No files found for ${lane} at VU ${vus}"
+            echo "${lane},${vus},0,0,0,0" >> {{ workspace }}/k6-aggregated.csv
+            exit 0
+          fi
 
-        echo "${lane},${vus},${mean},${std},${min},${max}" \
-          >> {{ workspace }}/k6-aggregated.csv
+          # 3. Extract p99 values safely. 
+          # We use map(select(. != null)) to ensure one bad run doesn't break the math.
+          p99_values=$(jq -rs '[.[] | .metrics.http_req_duration.values["p(99)"]] | map(select(. != null))' "${files[@]}")
+
+          # 4. Calculate metrics with fallbacks for empty arrays
+          count=$(echo "$p99_values" | jq 'length')
+          
+          if [ "$count" -gt 0 ]; then
+            mean=$(echo "$p99_values" | jq 'add / length')
+            # Standard Deviation calculation (Population SD)
+            std=$(echo "$p99_values" | jq "if length > 1 then (map(. - $mean) | map(. * .) | add / length | sqrt) else 0 end")
+            min=$(echo "$p99_values" | jq 'min')
+            max=$(echo "$p99_values" | jq 'max')
+          else
+            mean=0; std=0; min=0; max=0
+          fi
+
+          # 5. Write to CSV
+          echo "${lane},${vus},${mean},${std},${min},${max}" >> {{ workspace }}/k6-aggregated.csv
+        executable: /bin/bash
       loop: "{{ lanes | product(k6_vus) | list }}"
       loop_control:
         label: "{{ item[0].name }}-vu{{ item[1] }}"
