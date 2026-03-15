@@ -7,7 +7,7 @@ export default function () {
   
   // Ensure this array matches the N_FEATURES in your scaler.json
   const payload = JSON.stringify({
-    features: [7, 159, 64, 29, 125, 27.4, 0.294, 40] 
+    features: [0.0, 126.0, 86.0, 27.0, 120.0, 27.399999618530273, 0.5149999856948853, 21.0, 3452.39990234375, 0.0, 3288.0]
   });
 
   const params = {
