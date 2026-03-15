@@ -1,19 +1,4 @@
 {
-  "method": "standard_scaler",
-  "feature_names": [
-    "Pregnancies",
-    "Glucose",
-    "BloodPressure",
-    "SkinThickness",
-    "Insulin",
-    "BMI",
-    "DiabetesPedigreeFunction",
-    "Age",
-    "Glucose_BMI",
-    "Age_Pregnancies",
-    "Insulin_BMI"
-  ],
-  "n_features": 11,
   "mean": [
     3.8192182410423454,
     121.67100977198697,
@@ -40,5 +25,18 @@
     157.81500440765095,
     3636.9567035181008
   ],
-  "usage": "Formula: (x - mean) / scale"
+  "feature_names": [
+    "Pregnancies",
+    "Glucose",
+    "BloodPressure",
+    "SkinThickness",
+    "Insulin",
+    "BMI",
+    "DiabetesPedigreeFunction",
+    "Age",
+    "Glucose_BMI",
+    "Age_Pregnancies",
+    "Insulin_BMI"
+  ],
+  "n_features": 11
 }
