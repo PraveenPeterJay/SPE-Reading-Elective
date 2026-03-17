@@ -29,7 +29,7 @@
   # ---------------------------------------------------------------------------
   tasks:
 
-    - name: "0a. Verify sudo and apt"
+    - name: "Verify sudo and apt"
       shell: |
         whoami
         apt-get update 2>&1 | tail -3
@@ -37,11 +37,11 @@
       changed_when: false
       ignore_errors: yes
 
-    - name: "0b. Show bootstrap output"
+    - name: "Show bootstrap output"
       debug:
         var: debug_out.stdout_lines
 
-    - name: "0c. Restore apt sources if missing"
+    - name: "Restore apt sources if missing"
       copy:
         dest: /etc/apt/sources.list
         content: |
@@ -50,7 +50,7 @@
           deb http://archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
         force: no          # only writes if the file is absent / empty
 
-    - name: "0d. Fix Jenkins repo GPG key (idempotent)"
+    - name: "Fix Jenkins repo GPG key (idempotent)"
       shell: |
         wget -O /usr/share/keyrings/jenkins-keyring.asc \
           https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
@@ -281,7 +281,7 @@
         docker run --rm --privileged \
           -v /sys/class/powercap:/sys/class/powercap -v /proc:/proc -v /var/run/docker.sock:/var/run/docker.sock \
           hubblo/scaphandre:latest \
-          json -t 320 --containers --max-top-consumers 20 > {{ workspace }}/energy_raw_{{ item.name }}.json &
+          json -t 120 --containers --max-top-consumers 20 > {{ workspace }}/energy_raw_{{ item.name }}.json &
         
         # Capture the background PID of the docker command
         MONITOR_PID=$!
@@ -291,20 +291,28 @@
 
         # 3. Sustained Load (The "Meat" of the benchmark)
         # We pass the port dynamically via the loop item
-        k6 run -e PORT={{ item.port }} --vus 50 --duration 300s {{ workspace }}/stress-test.js > /dev/null
+        k6 run -e PORT={{ item.port }} --vus 50 --duration 100s {{ workspace }}/stress-test.js > /dev/null
 
         # 4. Stop the monitor immediately after k6 finishes
-        kill $MONITOR_PID || true
-        docker ps -q --filter ancestor=hubblo/scaphandre | xargs -r docker stop > /dev/null 2>&1
+        docker ps -q --filter ancestor=hubblo/scaphandre | xargs -r docker kill --signal=2 > /dev/null
+        sleep 2
 
-        # 5. Numerical Integration (Summarizing the Snapshots)
-        # We strip the text header, slurp the stream, and sum the microwatts
-        raw_sum=$(sed -n '/\[{/,$p' {{ workspace }}/energy_raw_{{ item.name }}.json | \
-                  jq -s 'map(.[] | .consumers[] | select(.container.name | contains("{{ item.name }}")) | .consumption) | .[]' | \
-                  awk '{sum += $1} END {printf "%.10f", sum}')
+        # 5. HEAL THE JSON:
+        # If the file doesn't end with ']', append it to close the JSON array
+        # This prevents the "Unfinished JSON term" error
+        if [ "$(tail -c 1 {{ workspace }}/energy_raw_{{ item.name }}.json)" != "]" ]; then
+            echo "]" >> {{ workspace }}/energy_raw_{{ item.name }}.json
+        fi
+
+        # 6. Robust Extraction
+        # We use 'try ... catch' logic in JQ or just filter carefully
+        raw_val=$(sed -n '/\[{/,$p' {{ workspace }}/energy_raw_{{ item.name }}.json | \
+                  jq -s 'map(.[]? | .consumers[]?) | .[] | select(.container.name | contains("{{ item.name }}")) | .consumption' | \
+                  awk '{sum+=$1} END {printf "%.10f", sum}')
         
-        # 6. Final Calculation: (Sum / 1,000,000) * 2s sampling step = Total Joules
-        total_j=$(echo "scale=6; ($raw_sum / 1000000) * 2" | bc)
+        # 7. Final Calculation
+        avg_w=$(echo "scale=6; $raw_val / 1000000" | bc)
+        total_j=$(echo "scale=4; $avg_w * 2" | bc) # Watts * 2s step (Sum of snapshots)
         
         echo "{{ item.name }}: ${total_j} Joules" >> {{ workspace }}/sustainability-summary.txt
       loop: "{{ lanes }}"
