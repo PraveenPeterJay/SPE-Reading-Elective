@@ -299,7 +299,9 @@
 
         # 6. Robust Extraction
         raw_val=$(sed -n '/\[{/,$p' {{ workspace }}/energy_raw_{{ item.name }}.json | \
-                  jq -s 'map(.[]? | .consumers[]?) | .[] | select(.container.name | contains("{{ item.name }}")) | .consumption' | \
+                  jq -s --arg LANE "{{ item.name }}" 'map(.[]? | .consumers[]?) | .[] | 
+                  select(.container.name != null and (.container.name | type == "string") and (.container.name | contains($LANE))) | 
+                  .consumption' | \
                   awk '{sum+=$1} END {printf "%.10f", sum}')
         
         # 7. Final Calculation
