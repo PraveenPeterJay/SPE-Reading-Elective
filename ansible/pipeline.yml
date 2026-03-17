@@ -65,7 +65,7 @@
   # SECTION 1 — Tool installation
   # ---------------------------------------------------------------------------
 
-    - name: "1. Install system prerequisites"
+    - name: "Install system prerequisites"
       apt:
         name:
           - jq
@@ -87,7 +87,7 @@
       delay: 5
       until: apt_result is succeeded
 
-    - name: "2. Install k6"
+    - name: "Install k6"
       shell: |
         gpg --no-default-keyring \
           --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
@@ -99,14 +99,21 @@
       args:
         creates: /usr/bin/k6
 
-    - name: "3. Install Syft (SBOM)"
+    - name: "Install Syft (SBOM)"
       shell: >
         curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh
         | sh -s -- -b /usr/local/bin
       args:
         creates: /usr/local/bin/syft
 
-    - name: "4a. Install Trivy (CVE scanner)"
+    - name: "Install Scaphandre (Energy Monitoring)"
+      shell: |
+        curl -sSfL https://github.com/hubblo-org/scaphandre/releases/latest/download/scaphandre-x86_64-unknown-linux-musl -o /usr/local/bin/scaphandre
+        chmod +x /usr/local/bin/scaphandre
+      args:
+        creates: /usr/local/bin/scaphandre
+
+    - name: "Install Trivy (CVE scanner)"
       shell: |
         wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
           | gpg --dearmor | tee /usr/share/keyrings/trivy.gpg > /dev/null
@@ -116,7 +123,11 @@
       args:
         creates: /usr/bin/trivy
 
-    - name: "4b. Build Docker images"
+  # ---------------------------------------------------------------------------
+  # SECTION 2 — Build & start containers
+  # ---------------------------------------------------------------------------
+
+    - name: "Build Docker images"
       shell: |
         docker build -t secure-{{ item.name }}:latest \
           -f {{ item.name }}-app/Dockerfile \
@@ -129,30 +140,26 @@
       become: no
       register: build_result
  
-    - name: "4c. Confirm all images exist"
+    - name: "Confirm all images exist"
       shell: docker image inspect secure-{{ item.name }}:latest --format '{{ "{{" }}.Id{{ "}}" }}'
       loop: "{{ lanes }}"
       become: no
       register: image_check
       failed_when: image_check.rc != 0
 
-    - name: "4d. Stop and remove all containers from previous builds (if any)"
+    - name: "Stop and remove all containers from previous builds (if any)"
       shell: docker compose down
       args:
         chdir: "{{ workspace }}"
       become: no
 
-  # ---------------------------------------------------------------------------
-  # SECTION 2 — Build & start containers
-  # ---------------------------------------------------------------------------
-
-    - name: "5. Build and start all lanes"
+    - name: "Build and start all lanes"
       shell: docker-compose up --build -d
       args:
         chdir: "{{ workspace }}"
       become: no
 
-    - name: "6. Wait for all lanes to be healthy (up to 60 s)"
+    - name: "Wait for all lanes to be healthy (up to 60 s)"
       shell: |
         for i in $(seq 1 12); do
           status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:{{ item.port }}/health)
@@ -169,14 +176,14 @@
   # SECTION 3 — Security audit
   # ---------------------------------------------------------------------------
 
-    - name: "7. Generate SBOMs with Syft (CycloneDX JSON)"
+    - name: "Generate SBOMs with Syft (CycloneDX JSON)"
       shell: >
         syft secure-{{ item.name }}:latest -o cyclonedx-json
         > {{ workspace }}/sbom-{{ item.name }}.json
       loop: "{{ lanes }}"
       become: no
 
-    - name: "8. Extract SBOM component counts"
+    - name: "Extract SBOM component counts"
       shell: |
         count=$(jq '.components | length' {{ workspace }}/sbom-{{ item.name }}.json)
         echo "{{ item.name }}: $count components" \
@@ -184,7 +191,7 @@
       loop: "{{ lanes }}"
       become: no
 
-    - name: "9. Trivy CVE scan — full JSON + severity summary"
+    - name: "Trivy CVE scan — full JSON + severity summary"
       shell: |
         trivy image --format json -o {{ workspace }}/trivy-{{ item.name }}.json \
           secure-{{ item.name }}:latest
@@ -205,7 +212,7 @@
   # SECTION 4 — Syscall surface profiling (novel security metric)
   # ---------------------------------------------------------------------------
 
-    - name: "10. Profile syscall surface with strace (single inference)"
+    - name: "Profile syscall surface with strace (single inference)"
       shell: |
         strace -c -f \
           curl -s -X POST http://localhost:{{ item.port }}/predict \
@@ -227,7 +234,7 @@
   # SECTION 5 — Memory footprint
   # ---------------------------------------------------------------------------
 
-    - name: "11. Capture memory footprint (RSS) via docker stats"
+    - name: "Capture memory footprint (RSS) via docker stats"
       shell:
         cmd: |
           # 1. Warm-up inference
@@ -270,11 +277,47 @@
       loop: "{{ lanes }}"
       become: no
 
+    - name: "Measure Energy & Memory Aging"
+      shell: |
+        {% if item.name == lanes[0].name %}
+        > {{ workspace }}/sustainability-summary.txt
+        > {{ workspace }}/aging-summary.txt
+        {% endif %}
+
+        # 1. Start Scaphandre in background to monitor this specific container
+        container_id=$(docker ps --filter "publish={{ item.port }}" -q)
+        /usr/local/bin/scaphandre stdout -p "$container_id" -t 60 > {{ workspace }}/energy-raw-{{ item.name }}.txt &
+        SCAP_PID=$!
+
+        # 2. Sustained Load (Aging Test)
+        # Capture Initial RSS
+        mem_start=$(docker stats --no-stream --format "{% raw %}{{.MemUsage}}{% endraw %}" "$container_id" | awk '{print $1}' | sed 's/[^0-9.]//g')
+        
+        # Run k6 for 60 seconds
+        k6 run -e PORT={{ item.port }} --vus 50 --duration 60s {{ workspace }}/stress-test.js > /dev/null
+
+        # Capture Final RSS
+        mem_end=$(docker stats --no-stream --format "{% raw %}{{.MemUsage}}{% endraw %}" "$container_id" | awk '{print $1}' | sed 's/[^0-9.]//g')
+        
+        # 3. Cleanup Energy Monitor
+        kill $SCAP_PID || true
+
+        # 4. Process Results
+        # Energy: Sum the Joules consumed
+        total_joules=$(grep "W" {{ workspace }}/energy-raw-{{ item.name }}.txt | awk '{sum+=$1} END {print sum}')
+        leak_rate=$(echo "scale=4; ($mem_end - $mem_start)" | bc)
+
+        echo "{{ item.name }}: ${total_joules:-0} Joules/60s" >> {{ workspace }}/sustainability-summary.txt
+        echo "{{ item.name }}: ${leak_rate} MiB delta" >> {{ workspace }}/aging-summary.txt
+      loop: "{{ lanes }}"
+      become: no
+      ignore_errors: yes
+
   # ---------------------------------------------------------------------------
   # SECTION 6 — Cold-start latency
   # ---------------------------------------------------------------------------
 
-    - name: "12. Measure cold-start latency (stop → start → first request)"
+    - name: "Measure cold-start latency (stop → start → first request)"
       shell: |
         {% if item.name == lanes[0].name %}
         > {{ workspace }}/coldstart-summary.txt
@@ -305,7 +348,7 @@
   #             Produces mean ± std for p99 latency at each VU level
   # ---------------------------------------------------------------------------
 
-    - name: "13. k6 stress test — {{ item[0].name }} @ {{ item[1] }} VUs (run {{ item[2] }})"
+    - name: "k6 stress test — {{ item[0].name }} @ {{ item[1] }} VUs (run {{ item[2] }})"
       shell: |
         k6 run \
           -e PORT={{ item[0].port }} \
@@ -322,7 +365,7 @@
       become: no
       ignore_errors: yes
 
-    - name: "14. Aggregate k6 results — mean ± std per lane per VU level"
+    - name: "Aggregate k6 results — mean ± std per lane per VU level"
       shell:
         cmd: |
           lane="{{ item[0].name }}"
@@ -360,7 +403,7 @@
   # SECTION 8 — Accuracy (batch inference over test set)
   # ---------------------------------------------------------------------------
 
-    - name: "15a. Batch accuracy check"
+    - name: "Batch accuracy check"
       shell: |
         {% if item.name == lanes[0].name %}
         > {{ workspace }}/accuracy-summary.txt
@@ -380,7 +423,7 @@
   # SECTION 9 — Docker image size
   # ---------------------------------------------------------------------------
 
-    - name: "16. Record Docker image sizes"
+    - name: "Record Docker image sizes"
       shell: |
         {% if item.name == lanes[0].name %}
         > {{ workspace }}/imagesize-summary.txt
@@ -396,7 +439,7 @@
   # SECTION 10 — Consolidated summary report
   # ---------------------------------------------------------------------------
 
-    - name: "17. Generate consolidated research summary (summary.json)"
+    - name: "Generate consolidated research summary (summary.json)"
       shell: |
         cd {{ workspace }}
 
@@ -462,6 +505,8 @@
         accuracy      = read_kv(f"{ws}/accuracy-summary.txt")
         imagesizes    = read_kv(f"{ws}/imagesize-summary.txt")
         k6_rows       = read_k6_csv(f"{ws}/k6-aggregated.csv")
+        energy = read_kv(f"{ws}/sustainability-summary.txt")
+        aging  = read_kv(f"{ws}/aging-summary.txt")
 
         # Structure k6 results per lane
         k6_by_lane = {l: {} for l in lanes}
@@ -503,6 +548,10 @@
                     "k6_latency":      k6_by_lane.get(lane, {}),
                 },
                 "accuracy": accuracy.get(lane),
+            }
+            summary["lanes"][lane]["sustainability"] = {
+                "energy_joules_60s": energy.get(lane),
+                "memory_leak_delta_mib": aging.get(lane),
             }
 
         out_path = f"{ws}/summary.json"
@@ -578,7 +627,7 @@
   # SECTION 11 — Teardown
   # ---------------------------------------------------------------------------
 
-    - name: "19. Stop and remove all containers"
+    - name: "Stop and remove all containers"
       shell: docker-compose down
       args:
         chdir: "{{ workspace }}"
