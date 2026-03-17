@@ -276,45 +276,40 @@
         > {{ workspace }}/sustainability-summary.txt
         {% endif %}
 
-        # 1. Start Scaphandre in background (JSON Stream Mode)
-        # We use a 320s timeout to safely cover the 300s k6 run
+        # 1. Start Scaphandre in background
         docker run --rm --privileged \
           -v /sys/class/powercap:/sys/class/powercap -v /proc:/proc -v /var/run/docker.sock:/var/run/docker.sock \
           hubblo/scaphandre:latest \
           json -t 120 --containers --max-top-consumers 20 > {{ workspace }}/energy_raw_{{ item.name }}.json &
         
-        # Capture the background PID of the docker command
-        MONITOR_PID=$!
-        
-        # 2. Warm-up (Ensure Scaphandre has started sampling)
+        # 2. Warm-up
         sleep 5
 
-        # 3. Sustained Load (The "Meat" of the benchmark)
-        # We pass the port dynamically via the loop item
+        # 3. Load Test (100s)
         k6 run -e PORT={{ item.port }} --vus 50 --duration 100s {{ workspace }}/stress-test.js > /dev/null
 
-        # 4. Stop the monitor immediately after k6 finishes
+        # 4. Stop Monitor Gracefully
         docker ps -q --filter ancestor=hubblo/scaphandre | xargs -r docker kill --signal=2 > /dev/null
         sleep 2
 
-        # 5. HEAL THE JSON:
-        # If the file doesn't end with ']', append it to close the JSON array
-        # This prevents the "Unfinished JSON term" error
+        # 5. HEAL THE JSON
         if [ "$(tail -c 1 {{ workspace }}/energy_raw_{{ item.name }}.json)" != "]" ]; then
             echo "]" >> {{ workspace }}/energy_raw_{{ item.name }}.json
         fi
 
         # 6. Robust Extraction
-        # We use 'try ... catch' logic in JQ or just filter carefully
         raw_val=$(sed -n '/\[{/,$p' {{ workspace }}/energy_raw_{{ item.name }}.json | \
                   jq -s 'map(.[]? | .consumers[]?) | .[] | select(.container.name | contains("{{ item.name }}")) | .consumption' | \
                   awk '{sum+=$1} END {printf "%.10f", sum}')
         
         # 7. Final Calculation
-        avg_w=$(echo "scale=6; $raw_val / 1000000" | bc)
-        total_j=$(echo "scale=4; $avg_w * 2" | bc) # Watts * 2s step (Sum of snapshots)
-        
-        echo "{{ item.name }}: ${total_j} Joules" >> {{ workspace }}/sustainability-summary.txt
+        if [ -z "$raw_val" ] || [ "$raw_val" = "0.0000000000" ]; then
+            echo "{{ item.name }}: 0 Joules" >> {{ workspace }}/sustainability-summary.txt
+        else
+            avg_w=$(echo "scale=6; $raw_val / 1000000" | bc)
+            total_j=$(echo "scale=4; $avg_w * 2" | bc)
+            echo "{{ item.name }}: ${total_j} Joules" >> {{ workspace }}/sustainability-summary.txt
+        fi
       loop: "{{ lanes }}"
       loop_control:
         label: "Profiling Energy for {{ item.name }}"
