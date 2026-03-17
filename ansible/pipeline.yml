@@ -459,29 +459,24 @@
       shell: |
         cd {{ workspace }}
 
-        # Helper: read a summary txt file into a jq-compatible object
-        # Format expected: "lane: value"
-        txt_to_obj() {
-          local f="$1"
-          [ -f "$f" ] || echo "{}" && return
-          jq -Rn '[inputs | split(": ") | {(.[0]): .[1]}] | add // {}' < "$f"
-        }
-
         python3 - <<'PYEOF'
-        import json, csv, os
+        import json, csv, os, re
 
         ws = "{{ workspace }}"
 
         def read_kv(path):
-            """Parse 'lane: value' text files into a dict."""
+            """Parse 'lane: value' text files into a dict, stripping units."""
             out = {}
             try:
+                if not os.path.exists(path): return {}
                 for line in open(path):
                     line = line.strip()
                     if ': ' in line:
                         k, v = line.split(': ', 1)
-                        out[k.strip()] = v.strip()
-            except FileNotFoundError:
+                        # Extracts the first numeric value found (handles "1.23 J", "45 MiB", etc.)
+                        num = re.findall(r"[-+]?\d*\.\d+|\d+", v)
+                        out[k.strip()] = num[0] if num else v.strip()
+            except Exception:
                 pass
             return out
 
@@ -489,160 +484,117 @@
             path = f"{ws}/trivy-summary-{lane}.json"
             try:
                 return json.load(open(path))
-            except Exception:
+            except:
                 return {}
 
         def read_k6_csv(path):
             rows = []
             try:
                 with open(path) as f:
-                    reader = csv.DictReader(f,
-                        fieldnames=["lane","vus","mean_p99","std_p99","min_p99","max_p99"])
-                    for r in reader:
-                        rows.append(r)
-            except FileNotFoundError:
+                    reader = csv.DictReader(f, fieldnames=["lane","vus","mean_p99","std_p99","min_p99","max_p99"])
+                    for r in reader: rows.append(r)
+            except:
                 pass
             return rows
 
         def read_sbom_count(lane):
             path = f"{ws}/sbom-{lane}.json"
             try:
-                data = json.load(open(path))
-                return len(data.get("components", []))
-            except Exception:
-                return None
+                with open(path) as f:
+                    return len(json.load(f).get("components", []))
+            except:
+                return 0
 
         lanes = ["python", "rust", "wasm"]
-
-        sbom_counts   = {l: read_sbom_count(l) for l in lanes}
-        coldstart     = read_kv(f"{ws}/coldstart-summary.txt")
-        memory        = read_kv(f"{ws}/memory-summary.txt")
-        syscalls      = read_kv(f"{ws}/syscall-summary.txt")
-        accuracy      = read_kv(f"{ws}/accuracy-summary.txt")
-        imagesizes    = read_kv(f"{ws}/imagesize-summary.txt")
-        k6_rows       = read_k6_csv(f"{ws}/k6-aggregated.csv")
+        
+        # Load Metrics
+        sbom_counts    = {l: read_sbom_count(l) for l in lanes}
+        coldstart      = read_kv(f"{ws}/coldstart-summary.txt")
+        memory         = read_kv(f"{ws}/memory-summary.txt")
+        syscalls       = read_kv(f"{ws}/syscall-summary.txt")
+        accuracy       = read_kv(f"{ws}/accuracy-summary.txt")
+        imagesizes     = read_kv(f"{ws}/imagesize-summary.txt")
         sustainability = read_kv(f"{ws}/sustainability-summary.txt")
+        k6_rows        = read_k6_csv(f"{ws}/k6-aggregated.csv")
 
-        # Structure k6 results per lane
+        # Structure k6 results
         k6_by_lane = {l: {} for l in lanes}
-        for row in k6_rows:
-            lane = row["lane"]
-            vus  = row["vus"]
+        for r in k6_rows:
+            lane, vus = r["lane"], r["vus"]
             if lane in k6_by_lane:
                 k6_by_lane[lane][f"vu{vus}"] = {
-                    "mean_p99_ms": row["mean_p99"],
-                    "std_p99_ms":  row["std_p99"],
-                    "min_p99_ms":  row["min_p99"],
-                    "max_p99_ms":  row["max_p99"],
+                    "mean_p99": r["mean_p99"], "std_p99": r["std_p99"]
                 }
 
         summary = {
             "meta": {
-                "dataset":    "Pima Indians Diabetes",
-                "model":      "sklearn → ONNX (LogisticRegression / RFC)",
-                "k6_runs_per_scenario": {{ bench_runs }},
-                "k6_duration": "{{ k6_duration }}",
-                "k6_vu_levels": {{ k6_vus }},
+                "project": "SPE Research Infrastructure",
+                "duration": "300s",
+                "model": "Pima Diabetes Stacking/ONNX"
             },
             "lanes": {}
         }
 
-        for lane in lanes:
-            trivy = read_trivy(lane)
-            summary["lanes"][lane] = {
+        for l in lanes:
+            t = read_trivy(l)
+            summary["lanes"][l] = {
                 "security": {
-                    "sbom_component_count": sbom_counts.get(lane),
-                    "cve_total":            trivy.get("total_cves"),
-                    "cve_by_severity":      trivy.get("summary", {}),
-                    "distinct_syscalls":    syscalls.get(lane),
+                    "sbom_count": sbom_counts.get(l),
+                    "cves": t.get("total_cves", 0),
+                    "severities": t.get("summary", {}),
+                    "syscalls": syscalls.get(l)
                 },
                 "performance": {
-                    "cold_start_ms":   coldstart.get(lane),
-                    "memory_warm_mib": memory.get(lane),
-                    "image_size_mb":   imagesizes.get(lane),
-                    "k6_latency":      k6_by_lane.get(lane, {}),
+                    "cold_start_ms": coldstart.get(l),
+                    "memory_mib": memory.get(l),
+                    "image_mb": imagesizes.get(l),
+                    "energy_j": sustainability.get(l),
+                    "k6": k6_by_lane.get(l)
                 },
-                "accuracy": accuracy.get(lane),
+                "accuracy": accuracy.get(l)
             }
-            summary["lanes"][lane]["performance"]["energy_joules_300s"] = sustainability.get(lane)
 
-        out_path = f"{ws}/summary.json"
-        with open(out_path, "w") as f:
-            json.dump(summary, f, indent=2)
+        # ── GENERATE MARKDOWN ────────────────────────────────────────────────
+        md = ["# SPE Benchmark Summary\n"]
+        
+        # Table 1: Security
+        md += ["## Security Profile\n", "| Lane | SBOM | CVEs | Syscalls |", "|---|---|---|---|"]
+        for l in lanes:
+            sec = summary["lanes"][l]["security"]
+            md.append(f"| {l} | {sec['sbom_count']} | {sec['cves']} | {sec['syscalls']} |")
 
-        # Also emit a human-readable markdown table
-        md_lines = [
-            "# SPE Benchmark Summary\n",
-            "## Security Metrics\n",
-            "| Lane | SBOM Components | Total CVEs | CRITICAL | HIGH | Syscalls |",
-            "|------|----------------|-----------|----------|------|----------|",
-        ]
-        for lane in lanes:
-            s  = summary["lanes"][lane]["security"]
-            sev = s.get("cve_by_severity") or {}
-            md_lines.append(
-                f"| {lane} | {s.get('sbom_component_count','?')} "
-                f"| {s.get('cve_total','?')} "
-                f"| {sev.get('CRITICAL','0')} "
-                f"| {sev.get('HIGH','0')} "
-                f"| {s.get('distinct_syscalls','?')} |"
-            )
+        # Table 2: Performance
+        md += ["\n## Latency & Resources\n", "| Lane | Cold Start (ms) | Mem (MiB) | p99 @ 100VU |", "|---|---|---|---|"]
+        for l in lanes:
+            perf = summary["lanes"][l]["performance"]
+            p99 = perf["k6"].get("vu100", {}).get("mean_p99", "?")
+            md.append(f"| {l} | {perf['cold_start_ms']} | {perf['memory_mib']} | {p99} |")
 
-        md_lines += [
-            "\n## Performance Metrics (p99 latency ms, mean ± std)\n",
-            "| Lane | Cold-start ms | Mem (MiB) | Image MB | 10 VU | 50 VU | 100 VU |",
-            "|------|--------------|-----------|----------|-------|-------|--------|",
-        ]
-        for lane in lanes:
-            p  = summary["lanes"][lane]["performance"]
-            kl = p.get("k6_latency", {})
-            def fmt(vu):
-                d = kl.get(f"vu{vu}", {})
-                m = d.get("mean_p99_ms", "?")
-                s = d.get("std_p99_ms",  "?")
-                return f"{m}±{s}"
-            md_lines.append(
-                f"| {lane} | {p.get('cold_start_ms','?')} "
-                f"| {p.get('memory_warm_mib','?')} "
-                f"| {p.get('image_size_mb','?')} "
-                f"| {fmt(10)} | {fmt(50)} | {fmt(100)} |"
-            )
+        # Table 3: Sustainability (The 300s Metric)
+        md += ["\n## Sustainability & Efficiency Index\n", "| Lane | Avg Power (W) | Total Energy (J) | Accuracy |", "|---|---|---|---|"]
+        for l in lanes:
+            try:
+                joules = float(summary["lanes"][l]["performance"]["energy_j"] or 0)
+                avg_w = round(joules / 300, 6)
+                acc = summary["lanes"][l]["accuracy"]
+                md.append(f"| {l} | {avg_w} | {joules} | {acc} |")
+            except:
+                md.append(f"| {l} | Error | Error | ? |")
 
-        md_lines += [
-            "\n## Accuracy\n",
-            "| Lane | Accuracy |",
-            "|------|----------|",
-        ]
-        for lane in lanes:
-            md_lines.append(f"| {lane} | {summary['lanes'][lane].get('accuracy','?')} |")
-
-        md_lines += [
-            "\n## Sustainability & Efficiency Index\n",
-            "| Lane | Energy (Joules/300s) | Inferences per Joule |",
-            "|------|---------------------|----------------------|",
-        ]
-        for lane in lanes:
-            j = float(summary["lanes"][lane]["performance"].get("energy_joules_300s", 0))
-            # World-Class Metric: Assume 1000 iterations for calc if k6 output isn't parsed yet
-            efficiency = "N/A" if j == 0 else round(1000 / j, 2) 
-            md_lines.append(f"| {lane} | {j} J | {efficiency} |")
-
-        with open(f"{ws}/summary.md", "w") as f:
-            f.write("\n".join(md_lines))
-
-        print("Summary written to summary.json and summary.md")
+        with open(f"{ws}/summary.json", "w") as f: json.dump(summary, f, indent=2)
+        with open(f"{ws}/summary.md", "w") as f: f.write("\n".join(md))
         PYEOF
       args:
         chdir: "{{ workspace }}"
       become: no
 
-    - name: "18. Print summary to Ansible output"
+    - name: "Print summary to Ansible output"
       shell: "cat {{ workspace }}/summary.md"
       register: summary_out
       become: no
       changed_when: false
 
-    - name: "18b. Show summary"
+    - name: "Show summary"
       debug:
         var: summary_out.stdout_lines
 
