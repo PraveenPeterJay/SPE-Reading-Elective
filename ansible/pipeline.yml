@@ -106,23 +106,6 @@
       args:
         creates: /usr/local/bin/syft
 
-    - name: "Install Scaphandre (Energy Monitoring)"
-      shell: |
-        # Download the v1.0.0 release which uses this naming convention
-        curl -sSfL https://github.com/hubblo-org/scaphandre/releases/download/v1.0.0/scaphandre-v1.0.0-x86_64-unknown-linux-musl -o /usr/local/bin/scaphandre
-        
-        # Fallback if v1.0.0 path changes
-        if [ ! -s /usr/local/bin/scaphandre ]; then
-          curl -sSfL https://github.com/hubblo-org/scaphandre/releases/latest/download/scaphandre -o /usr/local/bin/scaphandre
-        fi
-
-        chmod +x /usr/local/bin/scaphandre
-      args:
-        creates: /usr/local/bin/scaphandre
-      register: scap_install
-      retries: 2
-      delay: 5
-
     - name: "Install Trivy (CVE scanner)"
       shell: |
         wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
